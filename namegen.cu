@@ -6,6 +6,22 @@
 #include <vector>
 
 #include <cuda_runtime.h>
+#include <nvToolsExt.h>
+
+nvtxRangeId_t nvtx_range_start(const char *message) {
+  nvtxEventAttributes_t eventAttrib={0};
+  eventAttrib.version = NVTX_VERSION;
+  eventAttrib.size = NVTX_EVENT_ATTRIB_STRUCT_SIZE;
+  eventAttrib.colorType = NVTX_COLOR_ARGB;
+  eventAttrib.messageType = NVTX_MESSAGE_TYPE_ASCII;
+  eventAttrib.message.ascii = message;
+  eventAttrib.color = 0xFF800080;
+  return nvtxRangeStartEx(&eventAttrib);
+}
+void nvtx_range_stop(nvtxRangeId_t nvtx_id) {
+  nvtxRangeEnd(nvtx_id);
+}
+
 
 // You can modify the data structure as you want
 struct Tensor {
@@ -117,23 +133,10 @@ Tensor *ftmp0;
  * output: [BATCH x EMBEDDING_DIM]
  */
 __global__ void embedding1(const float *input, const float *weight, float *output) {
-  int row         = threadIdx.y;
-  int w_row       = input[row];
-  int chunk_size  = EMBEDDING_DIM / blockDim.x;
-  int start       = chunk_size * threadIdx.x;
-  int end         = chunk_size * (threadIdx.x + 1);
-
-  for(int i = start; i < end; i++) {
-    output[row * EMBEDDING_DIM + i] = weight[w_row * EMBEDDING_DIM + i];
-  }
+  int col = blockIdx.x * blockDim.x + threadIdx.x;
+  int row = blockIdx.y * blockDim.y + threadIdx.y;
+  output[row * EMBEDDING_DIM + col] = weight[((int)input[row]) * EMBEDDING_DIM + col];
 }
-// pthread optimization (multicore)
-// void embedding2(Tensor *input, Tensor *weight, Tensor *output) {
-//   size_t b = input->shape[0];
-//   for(size_t i = 0; i < b; i++) {
-//     CHECK_CUDA(cudaMemcpy(output->buf + (i * EMBEDDING_DIM),weight->buf + (input->buf[i] * EMBEDDING_DIM),EMBEDDING_DIM * sizeof(float),cudaMemcpyDeviceToDevice));
-//   }
-// }
 
 /*
  * Reset Gate Kernel
@@ -142,28 +145,21 @@ __global__ void reset_gate_kernel(const float *x, const float *h, const float *w
   int col = blockIdx.x * blockDim.x + threadIdx.x;
   int row = blockIdx.y * blockDim.y + threadIdx.y;
 
-  int sum = 0;
+  float sum = bx[col] + bh[col];
   if (width_x == width_h) {
-    int tiling = (width_x) / blockDim.z;
-    int tiling_start = tiling * blockIdx.z;
-
-    for(int i = tiling_start; i < tiling_start + tiling; i++) {
-      sum += (x[row * width_x + i] * wx[col * width_x + i] + h[row * width_x + i] * wh[col * width_x + i]);
+    for(int i = 0; i < width_x; i++) {
+      sum += x[row * width_x + i] * wx[col * width_x + i] + h[row * width_h + i] * wh[col * width_h + i];
     }
   } else {
-    int tiling_x = width_x / blockDim.z;
-    int tiling_h = width_h / blockDim.z;
-    int tiling_start_x = tiling_x * blockIdx.z;
-    int tiling_start_h = tiling_h * blockIdx.z;
-  
-    for(int i = tiling_start_x; i < tiling_start_x + tiling_x; i++ ) {
+    for(int i = 0; i < width_x; i++ ) {
       sum += x[row * width_x + i] * wx[col * width_x + i];
     }
-    for (int i = tiling_start_h; i < tiling_start_h + tiling_h; i++) {
+    for (int i = 0; i < width_h; i++) {
       sum += h[row * width_h + i] * wh[col * width_h + i];
     }
   }
-  output[row * HIDDEN_DIM + col] = 1.0f / (1.0f + expf(- (sum + bx[col] + bh[col])));
+
+  output[row * HIDDEN_DIM + col] = 1.0 / (1.0 + expf(-sum));
 }
 
 /*
@@ -173,28 +169,20 @@ __global__ void candidate_gate_kernel(const float *x, const float *h, const floa
   int col = blockIdx.x * blockDim.x + threadIdx.x;
   int row = blockIdx.y * blockDim.y + threadIdx.y;
 
-  int sum = 0;
+  float sum = 0;
   if (width_x == width_h) {
-    int tiling = (width_x) / blockDim.z;
-    int tiling_start = tiling * blockIdx.z;
-
-    for(int i = tiling_start; i < tiling_start + tiling; i++) {
-      sum += (x[row * width_x + i] * wx[col * width_x + i] + r[row * width_x + i] * h[row * width_x + i] * wrh[col * width_x + i]);
+    for(int i = 0; i < width_x; i++) {
+      sum += (x[row * width_x + i] * wx[col * width_x + i] + r[row * width_x + col] * h[row * width_x + i] * wrh[col * width_x + i]);
     }
   } else {
-    int tiling_x = width_x / blockDim.z;
-    int tiling_h = width_h / blockDim.z;
-    int tiling_start_x = tiling_x * blockIdx.z;
-    int tiling_start_h = tiling_h * blockIdx.z;
-  
-    for(int i = tiling_start_x; i < tiling_start_x + tiling_x; i++ ) {
+    for(int i = 0; i < width_x; i++ ) {
       sum += x[row * width_x + i] * wx[col * width_x + i];
     }
-    for (int i = tiling_start_h; i < tiling_start_h + tiling_h; i++) {
-      sum += r[row * width_h + i] * h[row * width_h + i] * wrh[col * width_h + i];
+    for (int i = 0; i < width_h; i++) {
+      sum += r[row * width_h + col] * h[row * width_h + i] * wrh[col * width_h + i];
     }
   }
-  output[row * HIDDEN_DIM + col] = tanhf(sum + bx[col] + bh[col]);
+  output[row * HIDDEN_DIM + col] = tanhf(sum + bx[col] + r[row * width_h + col] * bh[col]);
 }
 
 /*
@@ -204,133 +192,36 @@ __global__ void candidate_gate_kernel(const float *x, const float *h, const floa
   int col = blockIdx.x * blockDim.x + threadIdx.x;
   int row = blockIdx.y * blockDim.y + threadIdx.y;
 
-  int sum = 0;
+  float sum = bx[col] + bh[col];
   if (width_x == width_h) {
-    int tiling = (width_x) / blockDim.z;
-    int tiling_start = tiling * blockIdx.z;
-
-    for(int i = tiling_start; i < tiling_start + tiling; i++) {
-      sum += (x[row * width_x + i] * wx[col * width_x + i] + h[row * width_x + i] * wh[col * width_x + i]);
+    for(int i = 0; i < width_x; i++) {
+      sum += (x[row * width_x + i] * wx[col * width_x + i] + h[row * width_h + i] * wh[col * width_h + i]);
     }
   } else {
-    int tiling_x = width_x / blockDim.z;
-    int tiling_h = width_h / blockDim.z;
-    int tiling_start_x = tiling_x * blockIdx.z;
-    int tiling_start_h = tiling_h * blockIdx.z;
-  
-    for(int i = tiling_start_x; i < tiling_start_x + tiling_x; i++ ) {
+    for(int i = 0; i < width_x; i++ ) {
       sum += x[row * width_x + i] * wx[col * width_x + i];
     }
-    for (int i = tiling_start_h; i < tiling_start_h + tiling_h; i++) {
+    for (int i = 0; i < width_h; i++) {
       sum += h[row * width_h + i] * wh[col * width_h + i];
     }
   }
   int pos = row * HIDDEN_DIM + col;
-  output[pos] = g[pos] + (h[pos] - g[pos]) * (1.0 / (1 + expf(-(sum + bx[col] + bh[col]))));
+  output[pos] = g[pos] + (h[pos] - g[pos]) * (1.0 / (1.0 + expf(-sum)));
 }
 
 /*
- * Elementwise addition
- * input1: [*]
- * input2: [*] (same shape as input1)
- * output: [*] (same shape as input1)
+ * Matrix Multiplication
  */
-void elemwise_add(Tensor *input1, Tensor *input2, Tensor *output) {
-  size_t sn = input1->num_elem();
-  for (size_t i = 0; i < sn; i++) {
-    output->buf[i] = input1->buf[i] + input2->buf[i];
-  }
-}
+__global__ void matmul_kernel(const float *x , const float *w, const float *b, float *output, int M, int N, int K) {
+  int col = blockIdx.x * blockDim.x + threadIdx.x;
+  int row = blockIdx.y * blockDim.y + threadIdx.y;
 
-/*
- * Elementwise (1-x)
- * input: [*]
- * output: [*] (same shape as input)
- */
-void elemwise_oneminus(Tensor *input, Tensor *output) {
-  size_t n = input->num_elem();
-  for (size_t i = 0; i < n; i++) {
-    float x = input->buf[i];
-    output->buf[i] = 1.0 - x;
+  float sum = b[col];
+  for(int i = 0; i < K; i++) {
+    if (((row * K +i) >= (M * K)) || ((col*K+i) >= (N*K))) printf("exceed");
+    sum += x[row * K + i] * w[col * K +i];
   }
-}
-
-/*
- * Elementwise multiplication
- * input1: [*]
- * input2: [*] (same shape as input1)
- * output: [*] (same shape as input1)
- */
-void elemwise_mul(Tensor *input1, Tensor *input2, Tensor *output) {
-  size_t sn = input1->num_elem();
-  for (size_t i = 0; i < sn; i++) {
-    output->buf[i] = input1->buf[i] * input2->buf[i];
-  }
-}
-
-/*
- * Elementwise tanh(x)
- * input: [*]
- * output: [*] (same shape as input)
- */
-void elemwise_tanh(Tensor *input, Tensor *output) {
-  size_t n = input->num_elem();
-  for (size_t i = 0; i < n; i++) {
-    float x = input->buf[i];
-    output->buf[i] = tanhf(x);
-  }
-}
-
-/*
- * Elementwise Sigmoid 1 / (1 + exp(-x))
- * input: [*]
- * output: [*] (same shape as input)
- */
-void elemwise_sigmoid(Tensor *input, Tensor *output) {
-  size_t n = input->num_elem();
-  for (size_t i = 0; i < n; i++) {
-    float x = input->buf[i];
-    output->buf[i] = 1.0 / (1.0 + expf(-x));
-  }
-}
-
-/*
- * SGEMV
- * input1: [N x K]
- * input2: [K]
- * output: [N]
- */
-void matvec(Tensor *input1, Tensor *input2, Tensor *output) {
-  size_t N_ = input1->shape[0];
-  size_t K_ = input1->shape[1];
-  for (size_t i = 0; i < N_; i++) {
-    float c = 0.0;
-    for (size_t j = 0; j < K_; j++) {
-      c += input1->buf[i * K_ + j] * input2->buf[j];
-    }
-    output->buf[i] = c;
-  }
-}
-
-/*
- * SGEMM
- * input1: [M x K]
- * input2: [K x N]
- * output: [M x N]
- */
-void matmul(Tensor *input1, Tensor *input2, Tensor *output) {
-  size_t M_ = input1->shape[0];
-  size_t K_ = input1->shape[1];
-  size_t N_ = input2->shape[1];
-  for (size_t i = 0; i < M_; i++) {
-    for (size_t j = 0; j < N_; j++) {
-      float c = 0.0;
-      for (size_t k = 0; k < K_; k++) {
-        c += input1->buf[i * K_ + k] * input2->buf[k * N_ + j];
-      }
-      output->buf[i * N_ + j] = c;
-    }
-  }
+  output[row * N + col] = sum;
 }
 
 /*
@@ -341,15 +232,18 @@ void matmul(Tensor *input1, Tensor *input2, Tensor *output) {
  * output: [*], (same shape as input)
  */
 void softmax(Tensor *input, Tensor *output) {
-  size_t n = input->num_elem();
-  float sum = 0.0;
-  for (size_t i = 0; i < n; i++) {
-    float x = input->buf[i];
-    sum += expf(x);
-  }
-  for (size_t i = 0; i < n; i++) {
-    float x = input->buf[i];
-    output->buf[i] = expf(x) / sum;
+  size_t M = input->shape[0];
+  size_t N = input->shape[1];
+  for(size_t y = 0; y < M; y++) {
+    float sum = 0.0;
+    for (size_t i = 0; i < N; i++) {
+      float x = input->buf[y*N+i];
+      sum += expf(x);
+    }
+    for (size_t i = 0; i < N; i++) {
+      float x = input->buf[y*N+i];
+      output->buf[y*N+i] = expf(x) / sum;
+    }
   }
 }
 
@@ -360,14 +254,14 @@ void softmax(Tensor *input, Tensor *output) {
  * input: [NUM_CHAR], probability distribution of the characters
  * rng_seq: [N*MAX_LEN],
  */
-int random_select(Tensor *input, Tensor *rng_seq, int rng_offset) {
+int random_select(Tensor *input, Tensor *rng_seq, int rng_offset, int in_offset) {
   float r = rng_seq->buf[rng_offset];
-  size_t n = input->num_elem();
+  size_t n = input->shape[1];
   float psum = 0.0;
-  for (size_t i = 0; i < n; i++) {
+  for (size_t i = in_offset; i < in_offset + NUM_CHAR; i++) {
     psum += input->buf[i];
     if (psum > r) {
-      return i;
+      return i - in_offset;
     }
   }
   return n - 1;
@@ -433,41 +327,7 @@ void namegen_initialize(int N, char *parameter_fname) {
   z1 = new Tensor({BATCH_SIZE, HIDDEN_DIM});
   n0 = new Tensor({BATCH_SIZE, HIDDEN_DIM});
   n1 = new Tensor({BATCH_SIZE, HIDDEN_DIM});
-  f = new Tensor({BATCH_SIZE, NUM_CHAR});
-
-  rtmp00 = new Tensor({BATCH_SIZE, HIDDEN_DIM});
-  rtmp10 = new Tensor({BATCH_SIZE, HIDDEN_DIM});
-
-  ztmp00 = new Tensor({BATCH_SIZE, HIDDEN_DIM});
-  ztmp01 = new Tensor({BATCH_SIZE, HIDDEN_DIM});
-  ztmp02 = new Tensor({BATCH_SIZE, HIDDEN_DIM});
-  ztmp03 = new Tensor({BATCH_SIZE, HIDDEN_DIM});
-  ztmp04 = new Tensor({BATCH_SIZE, HIDDEN_DIM});
-  ztmp10 = new Tensor({BATCH_SIZE, HIDDEN_DIM});
-  ztmp11 = new Tensor({BATCH_SIZE, HIDDEN_DIM});
-  ztmp12 = new Tensor({BATCH_SIZE, HIDDEN_DIM});
-  ztmp13 = new Tensor({BATCH_SIZE, HIDDEN_DIM});
-  ztmp14 = new Tensor({BATCH_SIZE, HIDDEN_DIM});
-
-  ntmp00 = new Tensor({BATCH_SIZE, HIDDEN_DIM});
-  ntmp01 = new Tensor({BATCH_SIZE, HIDDEN_DIM});
-  ntmp02 = new Tensor({BATCH_SIZE, HIDDEN_DIM});
-  ntmp03 = new Tensor({BATCH_SIZE, HIDDEN_DIM});
-  ntmp04 = new Tensor({BATCH_SIZE, HIDDEN_DIM});
-  ntmp05 = new Tensor({BATCH_SIZE, HIDDEN_DIM});
-  ntmp10 = new Tensor({BATCH_SIZE, HIDDEN_DIM});
-  ntmp11 = new Tensor({BATCH_SIZE, HIDDEN_DIM});
-  ntmp12 = new Tensor({BATCH_SIZE, HIDDEN_DIM});
-  ntmp13 = new Tensor({BATCH_SIZE, HIDDEN_DIM});
-  ntmp14 = new Tensor({BATCH_SIZE, HIDDEN_DIM});
-  ntmp15 = new Tensor({BATCH_SIZE, HIDDEN_DIM});
-
-  htmp00 = new Tensor({BATCH_SIZE, HIDDEN_DIM});
-  htmp01 = new Tensor({BATCH_SIZE, HIDDEN_DIM});
-  htmp02 = new Tensor({BATCH_SIZE, HIDDEN_DIM});
-  htmp10 = new Tensor({BATCH_SIZE, HIDDEN_DIM});
-  htmp11 = new Tensor({BATCH_SIZE, HIDDEN_DIM});
-  htmp12 = new Tensor({BATCH_SIZE, HIDDEN_DIM});
+  f = new Tensor({NUM_CHAR});
 
   rfloats = new Tensor({N * MAX_LEN});
   ftmp0 = new Tensor({BATCH_SIZE, NUM_CHAR});
@@ -491,72 +351,76 @@ void namegen(int N, float *random_floats, char *output) {
 
     /* Initialize input and hidden vector. */
     /* One hidden vector for each GRU layer */
-    CHECK_CUDA(cudaMemset(input->cuda_buf, SOS, min(BATCH_SIZE, N - n * BATCH_SIZE)));
-    CHECK_CUDA(cudaDeviceSynchronize());
+    for(int i = 0; i < BATCH_SIZE; i++) input->buf[i] = SOS;
+    input->to_cuda();
     hidden0->set_zero();
     hidden1->set_zero();
-    CHECK_CUDA(cudaDeviceSynchronize());
 
     for (int l = 0; l < MAX_LEN; l++) {
       /* Embedding */
-      dim3 blockDim(EMBEDDING_DIM / EMBEDDING_CHUNK, BATCH_SIZE);
-      embedding1<<<1, blockDim>>>(input->cuda_buf, character_embedding->cuda_buf, emb_out->cuda_buf);
+      dim3 gridDim(EMBEDDING_DIM / EMBEDDING_PAR, BATCH_SIZE / E_BATCH_PAR);
+      dim3 blockDim(EMBEDDING_PAR, E_BATCH_PAR);
+      embedding1<<<gridDim, blockDim>>>(input->cuda_buf, character_embedding->cuda_buf, emb_out->cuda_buf);
       CHECK_CUDA(cudaGetLastError());
-      CHECK_CUDA(cudaDeviceSynchronize());
 
       /* First layer r */
-      dim3 gridDim(HIDDEN_DIM / R_HIDDEN_PAR, BATCH_SIZE / R_BATCH_PAR);
-      blockDim = dim3(R_HIDDEN_PAR, R_BATCH_PAR, R_TILING);
+      gridDim = dim3(HIDDEN_DIM / R_HIDDEN_PAR, BATCH_SIZE / R_BATCH_PAR);
+      blockDim = dim3(R_HIDDEN_PAR, R_BATCH_PAR);
       reset_gate_kernel<<<gridDim, blockDim>>>(emb_out->cuda_buf, hidden0->cuda_buf, W_ir0->cuda_buf, W_hr0->cuda_buf, b_ir0->cuda_buf, b_hr0->cuda_buf, r0->cuda_buf, emb_out->shape[1], hidden0->shape[1]);
       CHECK_CUDA(cudaGetLastError());
-      CHECK_CUDA(cudaDeviceSynchronize());
 
       /* First layer n */
       gridDim = dim3(HIDDEN_DIM / R_HIDDEN_PAR, BATCH_SIZE / R_BATCH_PAR);
-      blockDim = dim3(R_HIDDEN_PAR, R_BATCH_PAR, R_TILING);
+      blockDim = dim3(R_HIDDEN_PAR, R_BATCH_PAR);
       candidate_gate_kernel<<<gridDim, blockDim>>>(emb_out->cuda_buf, hidden0->cuda_buf, r0->cuda_buf, W_in0->cuda_buf, W_hn0->cuda_buf, b_in0->cuda_buf, b_hn0->cuda_buf, n0->cuda_buf, emb_out->shape[1], hidden0->shape[1]);
       CHECK_CUDA(cudaGetLastError());
-      CHECK_CUDA(cudaDeviceSynchronize());
 
       /* First layer h (hidden) */
       gridDim = dim3(HIDDEN_DIM / R_HIDDEN_PAR, BATCH_SIZE / R_BATCH_PAR);
-      blockDim = dim3(R_HIDDEN_PAR, R_BATCH_PAR, R_TILING);
+      blockDim = dim3(R_HIDDEN_PAR, R_BATCH_PAR);
       final_gate_kernel<<<gridDim, blockDim>>>(emb_out->cuda_buf, hidden0->cuda_buf, W_iz0->cuda_buf, W_hz0->cuda_buf, b_iz0->cuda_buf, b_hz0->cuda_buf, n0->cuda_buf, z0->cuda_buf, emb_out->shape[1], hidden0->shape[1]);
       CHECK_CUDA(cudaGetLastError());
       CHECK_CUDA(cudaMemcpy(hidden0->cuda_buf, z0->cuda_buf, BATCH_SIZE * HIDDEN_DIM * sizeof(float), cudaMemcpyDeviceToDevice));
 
-      CHECK_CUDA(cudaDeviceSynchronize());
       /* Second layer r */
       gridDim = dim3(HIDDEN_DIM / R_HIDDEN_PAR, BATCH_SIZE / R_BATCH_PAR);
-      blockDim = dim3(R_HIDDEN_PAR, R_BATCH_PAR, R_TILING);
-      reset_gate_kernel<<<gridDim, blockDim>>>(hidden0->cuda_buf, hidden1->cuda_buf, W_ir1->cuda_buf, W_hr1->cuda_buf, b_ir1->cuda_buf, b_hr1->cuda_buf, rtmp10->cuda_buf, hidden0->shape[1], hidden1->shape[1]);
+      blockDim = dim3(R_HIDDEN_PAR, R_BATCH_PAR);
+      reset_gate_kernel<<<gridDim, blockDim>>>(hidden0->cuda_buf, hidden1->cuda_buf, W_ir1->cuda_buf, W_hr1->cuda_buf, b_ir1->cuda_buf, b_hr1->cuda_buf, r1->cuda_buf, hidden0->shape[1], hidden1->shape[1]);
       CHECK_CUDA(cudaGetLastError());
 
-      CHECK_CUDA(cudaDeviceSynchronize());
       /* Second layer n */
       gridDim = dim3(HIDDEN_DIM / R_HIDDEN_PAR, BATCH_SIZE / R_BATCH_PAR);
-      blockDim = dim3(R_HIDDEN_PAR, R_BATCH_PAR, R_TILING);
+      blockDim = dim3(R_HIDDEN_PAR, R_BATCH_PAR);
       candidate_gate_kernel<<<gridDim, blockDim>>>(hidden0->cuda_buf, hidden1->cuda_buf, r1->cuda_buf, W_in1->cuda_buf, W_hn1->cuda_buf, b_in1->cuda_buf, b_hn1->cuda_buf, n1->cuda_buf, hidden0->shape[1], hidden1->shape[1]);
       CHECK_CUDA(cudaGetLastError());
-      CHECK_CUDA(cudaDeviceSynchronize());
+
       /* Second layer h (hidden) */
       gridDim = dim3(HIDDEN_DIM / R_HIDDEN_PAR, BATCH_SIZE / R_BATCH_PAR);
-      blockDim = dim3(R_HIDDEN_PAR, R_BATCH_PAR, R_TILING);
+      blockDim = dim3(R_HIDDEN_PAR, R_BATCH_PAR);
       final_gate_kernel<<<gridDim, blockDim>>>(hidden0->cuda_buf, hidden1->cuda_buf, W_iz1->cuda_buf, W_hz1->cuda_buf, b_iz1->cuda_buf, b_hz1->cuda_buf, n1->cuda_buf, z1->cuda_buf, hidden0->shape[1], hidden1->shape[1]);
       CHECK_CUDA(cudaGetLastError());
       CHECK_CUDA(cudaMemcpy(hidden1->cuda_buf, z1->cuda_buf, BATCH_SIZE * HIDDEN_DIM * sizeof(float), cudaMemcpyDeviceToDevice));
-      CHECK_CUDA(cudaDeviceSynchronize());
+      
+      /* Fully connected layer */
+      gridDim = dim3(NUM_CHAR / F_CHAR_PAR, BATCH_SIZE / F_BATCH_PAR);
+      blockDim = dim3(F_CHAR_PAR, F_BATCH_PAR);
+      matmul_kernel<<<gridDim, blockDim>>>(hidden1->cuda_buf, W_fc->cuda_buf, b_fc->cuda_buf, ftmp0->cuda_buf, BATCH_SIZE, NUM_CHAR, HIDDEN_DIM);
+      CHECK_CUDA(cudaGetLastError());
 
-      hidden1->to_cpu();
-      for(int i = 0; i < 10; i++) {
-        for(int j = 0; j < 10; j++) {
-          printf("%f ", hidden1->buf[i * EMBEDDING_DIM + j]);
-        }
-        puts("");
+      ftmp0->to_cpu();
+      rfloats->to_cpu();
+      
+      nvtxRangeId_t cpuid = nvtx_range_start("cpu range");
+      softmax(ftmp0, char_prob);
+      for(int i = 0; i < BATCH_SIZE; i++) {
+        /* Random select */
+        int selected_char = random_select(char_prob, rfloats, (n * BATCH_SIZE + i) * MAX_LEN + l, i * NUM_CHAR);
+        output[(n * BATCH_SIZE + i) * (MAX_LEN + 1) + l] = selected_char;
+        input->buf[i] = (float)selected_char;
       }
-      break;
+      input->to_cuda();
+      nvtx_range_stop(cpuid);
     }
-    break;
   }
 }
 

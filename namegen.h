@@ -9,18 +9,18 @@
 #define HIDDEN_DIM 1024
 
 // CONFIG
+#define BATCH_SIZE 4096
 // embedding layer config
-#define BATCH_SIZE 16
-#define EMBEDDING_CHUNK 32
+#define E_BATCH_PAR 32
+#define EMBEDDING_PAR 32
 
 // gate config
 #define R_HIDDEN_PAR 32
-#define R_BATCH_PAR 8
-#define R_TILING 4
+#define R_BATCH_PAR 32
 
-// activation config
-#define S_HIDDEN_PAR 32
-#define S_BATCH_PAR 32
+// FC config
+#define F_CHAR_PAR 32
+#define F_BATCH_PAR 32
 
 #define OFFSET0 0
 

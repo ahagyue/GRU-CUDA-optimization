@@ -2,3 +2,4 @@
 main
 model.bin
 bin/
+*.nsys-rep
