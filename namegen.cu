@@ -11,37 +11,60 @@
 struct Tensor {
 
   /* Alloc memory */
-  Tensor(std::vector<int> shape_) {
+  Tensor(std::vector<int> shape_, bool isCuda_=true) {
     ndim = shape_.size();
     for (size_t i = 0; i < ndim; i++) {
       shape[i] = shape_[i];
     }
-
+    
     size_t n = num_elem();
+    isCuda = isCuda_;
+    CHECK_CUDA(cudaMalloc(&cuda_buf, n * sizeof(float)));
     buf = (float *)malloc(n * sizeof(float));
   }
 
+  void to_cuda(){
+    size_t n = num_elem();
+    CHECK_CUDA(cudaMemcpy(cuda_buf, buf, n * sizeof(float), cudaMemcpyHostToDevice));
+  }
+
+  void to_cpu(){
+    size_t n = num_elem();
+    CHECK_CUDA(cudaMemcpy(buf, cuda_buf, n * sizeof(float), cudaMemcpyDeviceToHost));
+  }
+
   /* Alloc memory and copy */
-  Tensor(std::vector<int> shape_, float *buf_) {
+  Tensor(std::vector<int> shape_, float *buf_, bool isCuda_=true) {
     ndim = shape_.size();
     for (size_t i = 0; i < ndim; i++) {
       shape[i] = shape_[i];
     }
 
     size_t n = num_elem();
+    isCuda = isCuda_;
+    CHECK_CUDA(cudaMalloc(&cuda_buf, n * sizeof(float)));
+    CHECK_CUDA(cudaMemcpy(cuda_buf, buf_, n * sizeof(float), cudaMemcpyHostToDevice));
     buf = (float *)malloc(n * sizeof(float));
     memcpy(buf, buf_, n * sizeof(float));
   }
 
   ~Tensor() {
-    if (buf != nullptr)
-      free(buf);
+    if (buf != nullptr) {
+      if (isCuda)
+        CHECK_CUDA(cudaFree(cuda_buf));
+      else
+        free(buf);
+    }
   }
 
   void set_zero() {
     size_t n = num_elem();
-    for (size_t i = 0; i < n; i++)
-      buf[i] = 0.0;
+    if (isCuda)
+      CHECK_CUDA(cudaMemset(cuda_buf, 0, n * sizeof(float)));
+    else {
+      for (size_t i = 0; i < n; i++)
+        buf[i] = 0.0;
+    }
   }
 
   size_t num_elem() {
@@ -53,6 +76,8 @@ struct Tensor {
 
   // Pointer to data
   float *buf = nullptr;
+  float *cuda_buf = nullptr;
+  bool isCuda = true;
 
   // Shape of tensor, from outermost dimension to innermost dimension.
   // e.g., {{1.0, -0.5, 2.3}, {4.3, 5.6, -7.8}} => shape = {2, 3}
@@ -87,16 +112,121 @@ Tensor *ftmp0;
 
 /*
  * Embedding
- * input: [1] (scalar)
+ * input: [BATCH] (vector)
  * weight: [NUM_CHAR x EMBEDDING_DIM]
- * output: [EMBEDDING_DIM]
+ * output: [BATCH x EMBEDDING_DIM]
  */
-void embedding(Tensor *input, Tensor *weight, Tensor *output) {
-  size_t n = weight->shape[1];
-  for (size_t i = 0; i < n; i++) {
-    int x = (int)input->buf[0];
-    output->buf[i] = weight->buf[x * n + i];
+__global__ void embedding1(const float *input, const float *weight, float *output) {
+  int row         = threadIdx.y;
+  int w_row       = input[row];
+  int chunk_size  = EMBEDDING_DIM / blockDim.x;
+  int start       = chunk_size * threadIdx.x;
+  int end         = chunk_size * (threadIdx.x + 1);
+
+  for(int i = start; i < end; i++) {
+    output[row * EMBEDDING_DIM + i] = weight[w_row * EMBEDDING_DIM + i];
   }
+}
+// pthread optimization (multicore)
+// void embedding2(Tensor *input, Tensor *weight, Tensor *output) {
+//   size_t b = input->shape[0];
+//   for(size_t i = 0; i < b; i++) {
+//     CHECK_CUDA(cudaMemcpy(output->buf + (i * EMBEDDING_DIM),weight->buf + (input->buf[i] * EMBEDDING_DIM),EMBEDDING_DIM * sizeof(float),cudaMemcpyDeviceToDevice));
+//   }
+// }
+
+/*
+ * Reset Gate Kernel
+ */
+__global__ void reset_gate_kernel(const float *x, const float *h, const float *wx, const float *wh, const float *bx, const float *bh, float *output, int width_x, int width_h) {
+  int col = blockIdx.x * blockDim.x + threadIdx.x;
+  int row = blockIdx.y * blockDim.y + threadIdx.y;
+
+  int sum = 0;
+  if (width_x == width_h) {
+    int tiling = (width_x) / blockDim.z;
+    int tiling_start = tiling * blockIdx.z;
+
+    for(int i = tiling_start; i < tiling_start + tiling; i++) {
+      sum += (x[row * width_x + i] * wx[col * width_x + i] + h[row * width_x + i] * wh[col * width_x + i]);
+    }
+  } else {
+    int tiling_x = width_x / blockDim.z;
+    int tiling_h = width_h / blockDim.z;
+    int tiling_start_x = tiling_x * blockIdx.z;
+    int tiling_start_h = tiling_h * blockIdx.z;
+  
+    for(int i = tiling_start_x; i < tiling_start_x + tiling_x; i++ ) {
+      sum += x[row * width_x + i] * wx[col * width_x + i];
+    }
+    for (int i = tiling_start_h; i < tiling_start_h + tiling_h; i++) {
+      sum += h[row * width_h + i] * wh[col * width_h + i];
+    }
+  }
+  output[row * HIDDEN_DIM + col] = 1.0f / (1.0f + expf(- (sum + bx[col] + bh[col])));
+}
+
+/*
+ * Candidate Gate Kernel
+ */
+__global__ void candidate_gate_kernel(const float *x, const float *h, const float *r, const float *wx, const float *wrh, const float *bx, const float *bh, float *output, int width_x, int width_h) {
+  int col = blockIdx.x * blockDim.x + threadIdx.x;
+  int row = blockIdx.y * blockDim.y + threadIdx.y;
+
+  int sum = 0;
+  if (width_x == width_h) {
+    int tiling = (width_x) / blockDim.z;
+    int tiling_start = tiling * blockIdx.z;
+
+    for(int i = tiling_start; i < tiling_start + tiling; i++) {
+      sum += (x[row * width_x + i] * wx[col * width_x + i] + r[row * width_x + i] * h[row * width_x + i] * wrh[col * width_x + i]);
+    }
+  } else {
+    int tiling_x = width_x / blockDim.z;
+    int tiling_h = width_h / blockDim.z;
+    int tiling_start_x = tiling_x * blockIdx.z;
+    int tiling_start_h = tiling_h * blockIdx.z;
+  
+    for(int i = tiling_start_x; i < tiling_start_x + tiling_x; i++ ) {
+      sum += x[row * width_x + i] * wx[col * width_x + i];
+    }
+    for (int i = tiling_start_h; i < tiling_start_h + tiling_h; i++) {
+      sum += r[row * width_h + i] * h[row * width_h + i] * wrh[col * width_h + i];
+    }
+  }
+  output[row * HIDDEN_DIM + col] = tanhf(sum + bx[col] + bh[col]);
+}
+
+/*
+ * Final Gate Kernel
+ */
+ __global__ void final_gate_kernel(const float *x, const float *h, const float *wx, const float *wh, const float *bx, const float *bh, const float *g, float *output, int width_x, int width_h) {
+  int col = blockIdx.x * blockDim.x + threadIdx.x;
+  int row = blockIdx.y * blockDim.y + threadIdx.y;
+
+  int sum = 0;
+  if (width_x == width_h) {
+    int tiling = (width_x) / blockDim.z;
+    int tiling_start = tiling * blockIdx.z;
+
+    for(int i = tiling_start; i < tiling_start + tiling; i++) {
+      sum += (x[row * width_x + i] * wx[col * width_x + i] + h[row * width_x + i] * wh[col * width_x + i]);
+    }
+  } else {
+    int tiling_x = width_x / blockDim.z;
+    int tiling_h = width_h / blockDim.z;
+    int tiling_start_x = tiling_x * blockIdx.z;
+    int tiling_start_h = tiling_h * blockIdx.z;
+  
+    for(int i = tiling_start_x; i < tiling_start_x + tiling_x; i++ ) {
+      sum += x[row * width_x + i] * wx[col * width_x + i];
+    }
+    for (int i = tiling_start_h; i < tiling_start_h + tiling_h; i++) {
+      sum += h[row * width_h + i] * wh[col * width_h + i];
+    }
+  }
+  int pos = row * HIDDEN_DIM + col;
+  output[pos] = g[pos] + (h[pos] - g[pos]) * (1.0 / (1 + expf(-(sum + bx[col] + bh[col]))));
 }
 
 /*
@@ -291,66 +421,57 @@ void namegen_initialize(int N, char *parameter_fname) {
   b_fc = new Tensor({NUM_CHAR}, parameter + OFFSET26);
 
   /* input, activations, output, etc. */
-  input = new Tensor({1});
-  emb_out = new Tensor({EMBEDDING_DIM});
+  input = new Tensor({BATCH_SIZE});
+  emb_out = new Tensor({BATCH_SIZE, EMBEDDING_DIM});
 
-  hidden0 = new Tensor({HIDDEN_DIM});
-  hidden1 = new Tensor({HIDDEN_DIM});
+  hidden0 = new Tensor({BATCH_SIZE, HIDDEN_DIM});
+  hidden1 = new Tensor({BATCH_SIZE, HIDDEN_DIM});
 
-  r0 = new Tensor({HIDDEN_DIM});
-  r1 = new Tensor({HIDDEN_DIM});
-  z0 = new Tensor({HIDDEN_DIM});
-  z1 = new Tensor({HIDDEN_DIM});
-  n0 = new Tensor({HIDDEN_DIM});
-  n1 = new Tensor({HIDDEN_DIM});
-  f = new Tensor({NUM_CHAR});
+  r0 = new Tensor({BATCH_SIZE, HIDDEN_DIM});
+  r1 = new Tensor({BATCH_SIZE, HIDDEN_DIM});
+  z0 = new Tensor({BATCH_SIZE, HIDDEN_DIM});
+  z1 = new Tensor({BATCH_SIZE, HIDDEN_DIM});
+  n0 = new Tensor({BATCH_SIZE, HIDDEN_DIM});
+  n1 = new Tensor({BATCH_SIZE, HIDDEN_DIM});
+  f = new Tensor({BATCH_SIZE, NUM_CHAR});
 
-  rtmp00 = new Tensor({HIDDEN_DIM});
-  rtmp01 = new Tensor({HIDDEN_DIM});
-  rtmp02 = new Tensor({HIDDEN_DIM});
-  rtmp03 = new Tensor({HIDDEN_DIM});
-  rtmp04 = new Tensor({HIDDEN_DIM});
-  rtmp10 = new Tensor({HIDDEN_DIM});
-  rtmp11 = new Tensor({HIDDEN_DIM});
-  rtmp12 = new Tensor({HIDDEN_DIM});
-  rtmp13 = new Tensor({HIDDEN_DIM});
-  rtmp14 = new Tensor({HIDDEN_DIM});
+  rtmp00 = new Tensor({BATCH_SIZE, HIDDEN_DIM});
+  rtmp10 = new Tensor({BATCH_SIZE, HIDDEN_DIM});
 
-  ztmp00 = new Tensor({HIDDEN_DIM});
-  ztmp01 = new Tensor({HIDDEN_DIM});
-  ztmp02 = new Tensor({HIDDEN_DIM});
-  ztmp03 = new Tensor({HIDDEN_DIM});
-  ztmp04 = new Tensor({HIDDEN_DIM});
-  ztmp10 = new Tensor({HIDDEN_DIM});
-  ztmp11 = new Tensor({HIDDEN_DIM});
-  ztmp12 = new Tensor({HIDDEN_DIM});
-  ztmp13 = new Tensor({HIDDEN_DIM});
-  ztmp14 = new Tensor({HIDDEN_DIM});
+  ztmp00 = new Tensor({BATCH_SIZE, HIDDEN_DIM});
+  ztmp01 = new Tensor({BATCH_SIZE, HIDDEN_DIM});
+  ztmp02 = new Tensor({BATCH_SIZE, HIDDEN_DIM});
+  ztmp03 = new Tensor({BATCH_SIZE, HIDDEN_DIM});
+  ztmp04 = new Tensor({BATCH_SIZE, HIDDEN_DIM});
+  ztmp10 = new Tensor({BATCH_SIZE, HIDDEN_DIM});
+  ztmp11 = new Tensor({BATCH_SIZE, HIDDEN_DIM});
+  ztmp12 = new Tensor({BATCH_SIZE, HIDDEN_DIM});
+  ztmp13 = new Tensor({BATCH_SIZE, HIDDEN_DIM});
+  ztmp14 = new Tensor({BATCH_SIZE, HIDDEN_DIM});
 
-  ntmp00 = new Tensor({HIDDEN_DIM});
-  ntmp01 = new Tensor({HIDDEN_DIM});
-  ntmp02 = new Tensor({HIDDEN_DIM});
-  ntmp03 = new Tensor({HIDDEN_DIM});
-  ntmp04 = new Tensor({HIDDEN_DIM});
-  ntmp05 = new Tensor({HIDDEN_DIM});
-  ntmp10 = new Tensor({HIDDEN_DIM});
-  ntmp11 = new Tensor({HIDDEN_DIM});
-  ntmp12 = new Tensor({HIDDEN_DIM});
-  ntmp13 = new Tensor({HIDDEN_DIM});
-  ntmp14 = new Tensor({HIDDEN_DIM});
-  ntmp15 = new Tensor({HIDDEN_DIM});
+  ntmp00 = new Tensor({BATCH_SIZE, HIDDEN_DIM});
+  ntmp01 = new Tensor({BATCH_SIZE, HIDDEN_DIM});
+  ntmp02 = new Tensor({BATCH_SIZE, HIDDEN_DIM});
+  ntmp03 = new Tensor({BATCH_SIZE, HIDDEN_DIM});
+  ntmp04 = new Tensor({BATCH_SIZE, HIDDEN_DIM});
+  ntmp05 = new Tensor({BATCH_SIZE, HIDDEN_DIM});
+  ntmp10 = new Tensor({BATCH_SIZE, HIDDEN_DIM});
+  ntmp11 = new Tensor({BATCH_SIZE, HIDDEN_DIM});
+  ntmp12 = new Tensor({BATCH_SIZE, HIDDEN_DIM});
+  ntmp13 = new Tensor({BATCH_SIZE, HIDDEN_DIM});
+  ntmp14 = new Tensor({BATCH_SIZE, HIDDEN_DIM});
+  ntmp15 = new Tensor({BATCH_SIZE, HIDDEN_DIM});
 
-  htmp00 = new Tensor({HIDDEN_DIM});
-  htmp01 = new Tensor({HIDDEN_DIM});
-  htmp02 = new Tensor({HIDDEN_DIM});
-  htmp10 = new Tensor({HIDDEN_DIM});
-  htmp11 = new Tensor({HIDDEN_DIM});
-  htmp12 = new Tensor({HIDDEN_DIM});
+  htmp00 = new Tensor({BATCH_SIZE, HIDDEN_DIM});
+  htmp01 = new Tensor({BATCH_SIZE, HIDDEN_DIM});
+  htmp02 = new Tensor({BATCH_SIZE, HIDDEN_DIM});
+  htmp10 = new Tensor({BATCH_SIZE, HIDDEN_DIM});
+  htmp11 = new Tensor({BATCH_SIZE, HIDDEN_DIM});
+  htmp12 = new Tensor({BATCH_SIZE, HIDDEN_DIM});
 
   rfloats = new Tensor({N * MAX_LEN});
-  ftmp0 = new Tensor({NUM_CHAR});
-  char_prob = new Tensor({NUM_CHAR});
-
+  ftmp0 = new Tensor({BATCH_SIZE, NUM_CHAR});
+  char_prob = new Tensor({BATCH_SIZE, NUM_CHAR});
 }
 
 /*
@@ -361,100 +482,81 @@ void namegen_initialize(int N, char *parameter_fname) {
  * output: 2D-array of size N x (MAX_LEN+1), allocaetd at main.cpp
  */
 void namegen(int N, float *random_floats, char *output) {
-
-  memcpy(rfloats->buf, random_floats, N * MAX_LEN * sizeof(float));
+  CHECK_CUDA(cudaMemcpy(rfloats->cuda_buf, random_floats, N * MAX_LEN * sizeof(float), cudaMemcpyHostToDevice));
   memset(output, 0, N * (MAX_LEN + 1) * sizeof(char));
 
   /* Generate N names */
-  for (int n = 0; n < N; n++) {
+  int batched_N = (N + BATCH_SIZE - 1) / BATCH_SIZE;
+  for (int n = 0; n < batched_N; n++) {
+
     /* Initialize input and hidden vector. */
     /* One hidden vector for each GRU layer */
-    input->buf[0] = SOS;
+    CHECK_CUDA(cudaMemset(input->cuda_buf, SOS, min(BATCH_SIZE, N - n * BATCH_SIZE)));
+    CHECK_CUDA(cudaDeviceSynchronize());
     hidden0->set_zero();
     hidden1->set_zero();
+    CHECK_CUDA(cudaDeviceSynchronize());
 
     for (int l = 0; l < MAX_LEN; l++) {
       /* Embedding */
-      embedding(input, character_embedding, emb_out);
+      dim3 blockDim(EMBEDDING_DIM / EMBEDDING_CHUNK, BATCH_SIZE);
+      embedding1<<<1, blockDim>>>(input->cuda_buf, character_embedding->cuda_buf, emb_out->cuda_buf);
+      CHECK_CUDA(cudaGetLastError());
+      CHECK_CUDA(cudaDeviceSynchronize());
 
       /* First layer r */
-      matvec(W_ir0, emb_out, rtmp00);
-      matvec(W_hr0, hidden0, rtmp01);
-      elemwise_add(rtmp00, b_ir0, rtmp02);
-      elemwise_add(rtmp02, rtmp01, rtmp03);
-      elemwise_add(rtmp03, b_hr0, rtmp04);
-      elemwise_sigmoid(rtmp04, r0);
-
-      /* First layer z */
-      matvec(W_iz0, emb_out, ztmp00);
-      matvec(W_hz0, hidden0, ztmp01);
-      elemwise_add(ztmp00, b_iz0, ztmp02);
-      elemwise_add(ztmp02, ztmp01, ztmp03);
-      elemwise_add(ztmp03, b_hz0, ztmp04);
-      elemwise_sigmoid(ztmp04, z0);
+      dim3 gridDim(HIDDEN_DIM / R_HIDDEN_PAR, BATCH_SIZE / R_BATCH_PAR);
+      blockDim = dim3(R_HIDDEN_PAR, R_BATCH_PAR, R_TILING);
+      reset_gate_kernel<<<gridDim, blockDim>>>(emb_out->cuda_buf, hidden0->cuda_buf, W_ir0->cuda_buf, W_hr0->cuda_buf, b_ir0->cuda_buf, b_hr0->cuda_buf, r0->cuda_buf, emb_out->shape[1], hidden0->shape[1]);
+      CHECK_CUDA(cudaGetLastError());
+      CHECK_CUDA(cudaDeviceSynchronize());
 
       /* First layer n */
-      matvec(W_in0, emb_out, ntmp00);
-      elemwise_add(ntmp00, b_in0, ntmp01);
-      matvec(W_hn0, hidden0, ntmp02);
-      elemwise_add(ntmp02, b_hn0, ntmp03);
-      elemwise_mul(r0, ntmp03, ntmp04);
-      elemwise_add(ntmp01, ntmp04, ntmp05);
-      elemwise_tanh(ntmp05, n0);
+      gridDim = dim3(HIDDEN_DIM / R_HIDDEN_PAR, BATCH_SIZE / R_BATCH_PAR);
+      blockDim = dim3(R_HIDDEN_PAR, R_BATCH_PAR, R_TILING);
+      candidate_gate_kernel<<<gridDim, blockDim>>>(emb_out->cuda_buf, hidden0->cuda_buf, r0->cuda_buf, W_in0->cuda_buf, W_hn0->cuda_buf, b_in0->cuda_buf, b_hn0->cuda_buf, n0->cuda_buf, emb_out->shape[1], hidden0->shape[1]);
+      CHECK_CUDA(cudaGetLastError());
+      CHECK_CUDA(cudaDeviceSynchronize());
 
       /* First layer h (hidden) */
-      elemwise_oneminus(z0, htmp00);
-      elemwise_mul(htmp00, n0, htmp01);
-      elemwise_mul(z0, hidden0, htmp02);
-      elemwise_add(htmp01, htmp02, hidden0);
+      gridDim = dim3(HIDDEN_DIM / R_HIDDEN_PAR, BATCH_SIZE / R_BATCH_PAR);
+      blockDim = dim3(R_HIDDEN_PAR, R_BATCH_PAR, R_TILING);
+      final_gate_kernel<<<gridDim, blockDim>>>(emb_out->cuda_buf, hidden0->cuda_buf, W_iz0->cuda_buf, W_hz0->cuda_buf, b_iz0->cuda_buf, b_hz0->cuda_buf, n0->cuda_buf, z0->cuda_buf, emb_out->shape[1], hidden0->shape[1]);
+      CHECK_CUDA(cudaGetLastError());
+      CHECK_CUDA(cudaMemcpy(hidden0->cuda_buf, z0->cuda_buf, BATCH_SIZE * HIDDEN_DIM * sizeof(float), cudaMemcpyDeviceToDevice));
 
+      CHECK_CUDA(cudaDeviceSynchronize());
       /* Second layer r */
-      matvec(W_ir1, hidden0, rtmp10);
-      matvec(W_hr1, hidden1, rtmp11);
-      elemwise_add(rtmp10, b_ir1, rtmp12);
-      elemwise_add(rtmp12, rtmp11, rtmp13);
-      elemwise_add(rtmp13, b_hr1, rtmp14);
-      elemwise_sigmoid(rtmp14, r1);
+      gridDim = dim3(HIDDEN_DIM / R_HIDDEN_PAR, BATCH_SIZE / R_BATCH_PAR);
+      blockDim = dim3(R_HIDDEN_PAR, R_BATCH_PAR, R_TILING);
+      reset_gate_kernel<<<gridDim, blockDim>>>(hidden0->cuda_buf, hidden1->cuda_buf, W_ir1->cuda_buf, W_hr1->cuda_buf, b_ir1->cuda_buf, b_hr1->cuda_buf, rtmp10->cuda_buf, hidden0->shape[1], hidden1->shape[1]);
+      CHECK_CUDA(cudaGetLastError());
 
-      /* Second layer z */
-      matvec(W_iz1, hidden0, ztmp10);
-      matvec(W_hz1, hidden1, ztmp11);
-      elemwise_add(ztmp10, b_iz1, ztmp12);
-      elemwise_add(ztmp12, ztmp11, ztmp13);
-      elemwise_add(ztmp13, b_hz1, ztmp14);
-      elemwise_sigmoid(ztmp14, z1);
-
+      CHECK_CUDA(cudaDeviceSynchronize());
       /* Second layer n */
-      matvec(W_in1, hidden0, ntmp10);
-      elemwise_add(ntmp10, b_in1, ntmp11);
-      matvec(W_hn1, hidden1, ntmp12);
-      elemwise_add(ntmp12, b_hn1, ntmp13);
-      elemwise_mul(r1, ntmp13, ntmp14);
-      elemwise_add(ntmp11, ntmp14, ntmp15);
-      elemwise_tanh(ntmp15, n1);
-
+      gridDim = dim3(HIDDEN_DIM / R_HIDDEN_PAR, BATCH_SIZE / R_BATCH_PAR);
+      blockDim = dim3(R_HIDDEN_PAR, R_BATCH_PAR, R_TILING);
+      candidate_gate_kernel<<<gridDim, blockDim>>>(hidden0->cuda_buf, hidden1->cuda_buf, r1->cuda_buf, W_in1->cuda_buf, W_hn1->cuda_buf, b_in1->cuda_buf, b_hn1->cuda_buf, n1->cuda_buf, hidden0->shape[1], hidden1->shape[1]);
+      CHECK_CUDA(cudaGetLastError());
+      CHECK_CUDA(cudaDeviceSynchronize());
       /* Second layer h (hidden) */
-      elemwise_oneminus(z1, htmp10);
-      elemwise_mul(htmp10, n1, htmp11);
-      elemwise_mul(z1, hidden1, htmp12);
-      elemwise_add(htmp11, htmp12, hidden1);
+      gridDim = dim3(HIDDEN_DIM / R_HIDDEN_PAR, BATCH_SIZE / R_BATCH_PAR);
+      blockDim = dim3(R_HIDDEN_PAR, R_BATCH_PAR, R_TILING);
+      final_gate_kernel<<<gridDim, blockDim>>>(hidden0->cuda_buf, hidden1->cuda_buf, W_iz1->cuda_buf, W_hz1->cuda_buf, b_iz1->cuda_buf, b_hz1->cuda_buf, n1->cuda_buf, z1->cuda_buf, hidden0->shape[1], hidden1->shape[1]);
+      CHECK_CUDA(cudaGetLastError());
+      CHECK_CUDA(cudaMemcpy(hidden1->cuda_buf, z1->cuda_buf, BATCH_SIZE * HIDDEN_DIM * sizeof(float), cudaMemcpyDeviceToDevice));
+      CHECK_CUDA(cudaDeviceSynchronize());
 
-      /* Fully connected layer */
-      matvec(W_fc, hidden1, ftmp0);
-      elemwise_add(ftmp0, b_fc, f);
-
-      /* Softmax */
-      softmax(f, char_prob);
-
-      /* Random select */
-      int selected_char = random_select(char_prob, rfloats, n * MAX_LEN + l);
-
-      output[n * (MAX_LEN + 1) + l] = selected_char;
-      input->buf[0] = selected_char;
-
-      if (selected_char == EOS)
-        break;
+      hidden1->to_cpu();
+      for(int i = 0; i < 10; i++) {
+        for(int j = 0; j < 10; j++) {
+          printf("%f ", hidden1->buf[i * EMBEDDING_DIM + j]);
+        }
+        puts("");
+      }
+      break;
     }
+    break;
   }
 }
 
@@ -507,15 +609,7 @@ void namegen_finalize() {
   delete f;
   delete char_prob;
   delete rtmp00;
-  delete rtmp01;
-  delete rtmp02;
-  delete rtmp03;
-  delete rtmp04;
   delete rtmp10;
-  delete rtmp11;
-  delete rtmp12;
-  delete rtmp13;
-  delete rtmp14;
   delete ztmp00;
   delete ztmp01;
   delete ztmp02;

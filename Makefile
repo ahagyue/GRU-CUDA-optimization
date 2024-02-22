@@ -2,6 +2,7 @@ TARGET=main
 OBJ_DIR=./bin
 OBJS=main.o util.o namegen.o
 OBJECTS=$(patsubst %.o,$(OBJ_DIR)/%.o,$(OBJS))
+CONFIGS=config.h
 
 CFLAGS=-std=c++14 -O3 -Wall -march=native -mavx2 -mfma -mno-avx512f -fopenmp -I/usr/local/cuda/include
 CUDA_CFLAGS:=$(foreach option, $(CFLAGS),-Xcompiler=$(option))

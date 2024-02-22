@@ -8,6 +8,20 @@
 #define EMBEDDING_DIM 512
 #define HIDDEN_DIM 1024
 
+// CONFIG
+// embedding layer config
+#define BATCH_SIZE 16
+#define EMBEDDING_CHUNK 32
+
+// gate config
+#define R_HIDDEN_PAR 32
+#define R_BATCH_PAR 8
+#define R_TILING 4
+
+// activation config
+#define S_HIDDEN_PAR 32
+#define S_BATCH_PAR 32
+
 #define OFFSET0 0
 
 #define OFFSET1 (OFFSET0 + NUM_CHAR * EMBEDDING_DIM)
