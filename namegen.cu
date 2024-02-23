@@ -7,6 +7,7 @@
 
 #include <cuda_runtime.h>
 #include <nvToolsExt.h>
+#include <omp.h>
 
 nvtxRangeId_t nvtx_range_start(const char *message) {
   nvtxEventAttributes_t eventAttrib={0};
@@ -35,18 +36,22 @@ struct Tensor {
     
     size_t n = num_elem();
     isCuda = isCuda_;
-    CHECK_CUDA(cudaMalloc(&cuda_buf, n * sizeof(float)));
+    for(int i = 0; i < 4; i++) {
+      CHECK_CUDA(cudaSetDevice(i));
+      CHECK_CUDA(cudaMalloc(&(cuda_buf[i]), n * sizeof(float)));
+    }
     buf = (float *)malloc(n * sizeof(float));
   }
 
-  void to_cuda(){
+  void to_cuda(int device){
     size_t n = num_elem();
-    CHECK_CUDA(cudaMemcpy(cuda_buf, buf, n * sizeof(float), cudaMemcpyHostToDevice));
+    CHECK_CUDA(cudaSetDevice(device));
+    CHECK_CUDA(cudaMemcpy(cuda_buf[device], buf, n * sizeof(float), cudaMemcpyHostToDevice));
   }
 
-  void to_cpu(){
+  void to_cpu(int device){
     size_t n = num_elem();
-    CHECK_CUDA(cudaMemcpy(buf, cuda_buf, n * sizeof(float), cudaMemcpyDeviceToHost));
+    CHECK_CUDA(cudaMemcpy(buf, cuda_buf[device], n * sizeof(float), cudaMemcpyDeviceToHost));
   }
 
   /* Alloc memory and copy */
@@ -58,25 +63,31 @@ struct Tensor {
 
     size_t n = num_elem();
     isCuda = isCuda_;
-    CHECK_CUDA(cudaMalloc(&cuda_buf, n * sizeof(float)));
-    CHECK_CUDA(cudaMemcpy(cuda_buf, buf_, n * sizeof(float), cudaMemcpyHostToDevice));
+    for(int i = 0; i < 4; i++) {
+      CHECK_CUDA(cudaSetDevice(i));
+      CHECK_CUDA(cudaMalloc(&cuda_buf[i], n * sizeof(float)));
+      CHECK_CUDA(cudaMemcpy(cuda_buf[i], buf_, n * sizeof(float), cudaMemcpyHostToDevice));
+    }
     buf = (float *)malloc(n * sizeof(float));
     memcpy(buf, buf_, n * sizeof(float));
   }
 
   ~Tensor() {
     if (buf != nullptr) {
-      if (isCuda)
-        CHECK_CUDA(cudaFree(cuda_buf));
+      if (isCuda) {
+        for(int i = 0; i < 4; i++)
+          CHECK_CUDA(cudaFree(cuda_buf[i]));
+      }
       else
         free(buf);
     }
   }
 
-  void set_zero() {
+  void set_zero(int device) {
     size_t n = num_elem();
-    if (isCuda)
-      CHECK_CUDA(cudaMemset(cuda_buf, 0, n * sizeof(float)));
+    if (isCuda) {
+      CHECK_CUDA(cudaMemset(cuda_buf[device], 0, n * sizeof(float)));
+    }
     else {
       for (size_t i = 0; i < n; i++)
         buf[i] = 0.0;
@@ -92,7 +103,7 @@ struct Tensor {
 
   // Pointer to data
   float *buf = nullptr;
-  float *cuda_buf = nullptr;
+  float *cuda_buf[4] = {nullptr, nullptr, nullptr, nullptr};
   bool isCuda = true;
 
   // Shape of tensor, from outermost dimension to innermost dimension.
@@ -326,48 +337,36 @@ __global__ void embedding1(const float *input, const float *weight, float *outpu
 ) {
   int gj = blockIdx.x, gi = blockIdx.y;
   int lj = threadIdx.x, li = threadIdx.y;
-  int x = lj % FV_PER_BLOCK * 4, y = li * 4 + lj / FV_PER_BLOCK;
-  int col = gj * blockDim.x + x, row = gi * blockDim.y + y;
-  int _col = 4 * lj, _row = 4 * li;
+
+  int col = gj * blockDim.x + lj;
+  int row = gi * blockDim.y + li;
 
   float _r = type == 2 ? r[row * width_h + col] : 1.0f;
 
-  __shared__ float xlocal[BLOCK_SIZE*4][BLOCK_SIZE+SHM_PADDING];
-  __shared__ float wxlocal[BLOCK_SIZE*4][BLOCK_SIZE+SHM_PADDING];
-  __shared__ float hlocal[BLOCK_SIZE*4][BLOCK_SIZE+SHM_PADDING];
-  __shared__ float whlocal[BLOCK_SIZE*4][BLOCK_SIZE+SHM_PADDING];
+  __shared__ float xlocal[BLOCK_SIZE][BLOCK_SIZE+SHM_PADDING];
+  __shared__ float wxlocal[BLOCK_SIZE][BLOCK_SIZE+SHM_PADDING];
+  __shared__ float hlocal[BLOCK_SIZE][BLOCK_SIZE+SHM_PADDING];
+  __shared__ float whlocal[BLOCK_SIZE][BLOCK_SIZE+SHM_PADDING];
 
-  float4 sum[4] = {make_float4(bx[col] + _r * bh[col]), };
+  float sum = bx[col] + _r * bh[col];
   if (width_x == width_h) {
     for(int i = 0; i < width_x; i += BLOCK_SIZE) {
-      float4 x4 = *(float4*)(&x[(row) * width_x + (i + x)]);
-      float4 wx4 = *(float4*)(&wx[(gj*BLOCK_SIZE+y) * width_x + (i+x)]);
-      float4 h4 = *(float4*)(&h[(row) * width_h + (i + lj * 4)]);
-      float4 wh4 = *(float4*)(&wh[(gj*BLOCK_SIZE+y) * width_h + (i+x)]);
-      for(int vec_i = 0; vec_i < 4; vec_i++) {
-        xlocal[y][x+vec_i] = ((float*)(&x4))[vec_i];
-        wxlocal[y][x+vec_i] = ((float*)(&wx4))[vec_i];
-        hlocal[y][x+vec_i] = ((float*)(&h4))[vec_i];
-        whlocal[y][x+vec_i] = ((float*)(&wh4))[vec_i];
-      }
+      xlocal[li][lj] = x[(row) * width_x + (i + lj)];
+      wxlocal[li][lj] = wx[(gj*BLOCK_SIZE+li) * width_x + (i+lj)];
+      hlocal[li][lj] = h[(row) * width_h + (i + lj)];
+      whlocal[li][lj] = wh[(gj*BLOCK_SIZE+li) * width_h + (i+lj)];
 
       __syncthreads();
 
       for(int j = 0; j < BLOCK_SIZE; j++) {
-
-        if (type == 2) sum += xlocal[_row][j] * wxlocal[_col][j] + _r * hlocal[_row][j] * whlocal[_col][j];
-        else sum += xlocal[_row][j] * wxlocal[_col][j] + hlocal[_row][j] * whlocal[_col][j];
+        sum += xlocal[li][j] * wxlocal[lj][j] + _r * hlocal[li][j] * whlocal[lj][j];
       }
       __syncthreads();
     }
   } else {
     for(int i = 0; i < width_x; i += BLOCK_SIZE) {
-      float4 x4 = *(float4*)(&x[(row) * width_x + (i + lj * 4)]);
-      float4 wx4 = *(float4*)(&wx[(gj*BLOCK_SIZE+li) * width_x + (i+lj * 4)]);
-      for(int vec_i = 0; vec_i < 4; vec_i++) {
-        xlocal[li][lj*4+vec_i] = ((float*)(&x4))[vec_i];
-        wxlocal[li][lj*4+vec_i] = ((float*)(&wx4))[vec_i];
-      }
+      xlocal[li][lj] = x[(row) * width_x + (i + lj)];
+      wxlocal[li][lj] = wx[(gj*BLOCK_SIZE+li) * width_x + (i+lj)];
       
       __syncthreads();
 
@@ -377,18 +376,13 @@ __global__ void embedding1(const float *input, const float *weight, float *outpu
       __syncthreads();
     }
     for (int i = 0; i < width_h; i += BLOCK_SIZE) {
-      float4 h4 = *(float4*)(&h[(row) * width_x + (i + lj * 4)]);
-      float4 wh4 = *(float4*)(&wh[(gj*BLOCK_SIZE+li) * width_x + (i+lj * 4)]);
-      for(int vec_i = 0; vec_i < 4; vec_i++) {
-        hlocal[li][lj*4+vec_i] = ((float*)(&h4))[vec_i];
-        whlocal[li][lj*4+vec_i] = ((float*)(&wh4))[vec_i];
-      }
+      hlocal[li][lj] = h[(row) * width_h + (i + lj)];
+      whlocal[li][lj] = wh[(gj*BLOCK_SIZE+li) * width_h + (i+lj)];
 
       __syncthreads();
 
       for(int j = 0; j < BLOCK_SIZE; j++) {
-        if (type == 2) sum += _r * hlocal[li][j] * whlocal[lj][j];
-        else sum += hlocal[li][j] * whlocal[lj][j];
+        sum += _r * hlocal[li][j] * whlocal[lj][j];
       }
       __syncthreads();
     }
@@ -473,12 +467,12 @@ __global__ void random_select_kernel(const float *input, const float *rng_seq, c
   for (size_t i = 0; i < width; i++) {
     psum += input[batch * width + i];
     if (psum > r) {
-      output1[(batch + output_offset) * (MAX_LEN + 1) + offset] =  (char)i;
+      output1[(batch) * (MAX_LEN + 1) + offset] =  (char)i;
       output2[batch] = (float)i;
       return;
     }
   }
-  output1[(batch + output_offset) * (MAX_LEN + 1) + offset] = (char)width-1;
+  output1[(batch) * (MAX_LEN + 1) + offset] = (char)width-1;
   output2[batch] = (float)width-1;
 }
 
@@ -530,6 +524,7 @@ int random_select(Tensor *input, Tensor *rng_seq, int rng_offset, int in_offset)
  * Do input-independent job here.
  */
 void namegen_initialize(int N, char *parameter_fname) {
+  int BATCH_SIZE = N / 4;
 
   /* Only the root process reads the parameter */
  
@@ -601,15 +596,11 @@ void namegen_initialize(int N, char *parameter_fname) {
  * output: 2D-array of size N x (MAX_LEN+1), allocaetd at main.cpp
  */
 void namegen(int N, float *random_floats, char *output) {
-  CHECK_CUDA(cudaMemcpy(rfloats->cuda_buf, random_floats, N * MAX_LEN * sizeof(float), cudaMemcpyHostToDevice));
-  memset(output, 0, N * (MAX_LEN + 1) * sizeof(char));
-  char *output_cuda;
-  CHECK_CUDA(cudaMalloc(&output_cuda, N * (MAX_LEN+1) * sizeof(char)));
-  CHECK_CUDA(cudaMemset(output_cuda, 0, N * (MAX_LEN+1) * sizeof(char)));
+  int BATCH_SIZE = N / 4;
 
   dim3 embGridDim(EMBEDDING_DIM / EMBEDDING_PAR, BATCH_SIZE / E_BATCH_PAR);
   dim3 embBlockDim(EMBEDDING_PAR, E_BATCH_PAR);
-  dim3 kernelGridDim(HIDDEN_DIM / M_BLOCK_SIZE, BATCH_SIZE / N_BLOCK_SIZE);
+  dim3 kernelGridDim(HIDDEN_DIM / BLOCK_SIZE, BATCH_SIZE / BLOCK_SIZE);
   dim3 kernelBlockDim(BLOCK_SIZE, BLOCK_SIZE);
   dim3 FcGridDim(NUM_CHAR / BLOCK_SIZE, BATCH_SIZE / BLOCK_SIZE);
   dim3 FcBlockDim(BLOCK_SIZE, BLOCK_SIZE);
@@ -619,28 +610,37 @@ void namegen(int N, float *random_floats, char *output) {
   dim3 randomBlockDim(R_BATCH_PAR);
 
   /* Generate N names */
-  int batched_N = (N + BATCH_SIZE - 1) / BATCH_SIZE;
-  for (int n = 0; n < batched_N; n++) {
+  #pragma omp parallel shared(output) num_threads(4)
+  {
+    int device = omp_get_thread_num();
+
+    CHECK_CUDA(cudaSetDevice(device));
+
+    CHECK_CUDA(cudaMemcpy(rfloats->cuda_buf[device], random_floats, N * MAX_LEN * sizeof(float), cudaMemcpyHostToDevice));
+    memset(output, 0, N * (MAX_LEN + 1) * sizeof(char));
+    char *output_cuda;
+    CHECK_CUDA(cudaMalloc(&output_cuda, BATCH_SIZE * (MAX_LEN+1) * sizeof(char)));
+    CHECK_CUDA(cudaMemset(output_cuda, 0, BATCH_SIZE * (MAX_LEN+1) * sizeof(char)));
 
     /* Initialize input and hidden vector. */
     /* One hidden vector for each GRU layer */
     for(int i = 0; i < BATCH_SIZE; i++) input->buf[i] = SOS;
-    input->to_cuda();
-    hidden0->set_zero();
-    hidden1->set_zero();
+    input->to_cuda(device);
+    hidden0->set_zero(device);
+    hidden1->set_zero(device);
 
     for (int l = 0; l < MAX_LEN; l++) {
       /* Embedding */
-      embedding1<<<embGridDim, embBlockDim>>>(input->cuda_buf, character_embedding->cuda_buf, emb_out->cuda_buf);
+      embedding1<<<embGridDim, embBlockDim>>>(input->cuda_buf[device], character_embedding->cuda_buf[device], emb_out->cuda_buf[device]);
       CHECK_CUDA(cudaGetLastError());
 
       /* First layer r */
       unified_gate_kernel<<<kernelGridDim, kernelBlockDim>>>(
-        emb_out->cuda_buf, hidden0->cuda_buf, nullptr,
-        W_ir0->cuda_buf, W_hr0->cuda_buf,
-        b_ir0->cuda_buf, b_hr0->cuda_buf,
+        emb_out->cuda_buf[device], hidden0->cuda_buf[device], nullptr,
+        W_ir0->cuda_buf[device], W_hr0->cuda_buf[device],
+        b_ir0->cuda_buf[device], b_hr0->cuda_buf[device],
         nullptr,
-        r0->cuda_buf,
+        r0->cuda_buf[device],
         emb_out->shape[1], hidden0->shape[1],
         1
       );
@@ -648,11 +648,11 @@ void namegen(int N, float *random_floats, char *output) {
 
       /* First layer n */
       unified_gate_kernel<<<kernelGridDim, kernelBlockDim>>>(
-        emb_out->cuda_buf, hidden0->cuda_buf, r0->cuda_buf,
-        W_in0->cuda_buf, W_hn0->cuda_buf,
-        b_in0->cuda_buf, b_hn0->cuda_buf,
+        emb_out->cuda_buf[device], hidden0->cuda_buf[device], r0->cuda_buf[device],
+        W_in0->cuda_buf[device], W_hn0->cuda_buf[device],
+        b_in0->cuda_buf[device], b_hn0->cuda_buf[device],
         nullptr,
-        n0->cuda_buf,
+        n0->cuda_buf[device],
         emb_out->shape[1], hidden0->shape[1],
         2 
       );
@@ -660,24 +660,24 @@ void namegen(int N, float *random_floats, char *output) {
 
       /* First layer h (hidden) */
       unified_gate_kernel<<<kernelGridDim, kernelBlockDim>>>(
-        emb_out->cuda_buf, hidden0->cuda_buf, nullptr,
-        W_iz0->cuda_buf, W_hz0->cuda_buf, 
-        b_iz0->cuda_buf, b_hz0->cuda_buf, 
-        n0->cuda_buf, 
-        z0->cuda_buf, 
+        emb_out->cuda_buf[device], hidden0->cuda_buf[device], nullptr,
+        W_iz0->cuda_buf[device], W_hz0->cuda_buf[device], 
+        b_iz0->cuda_buf[device], b_hz0->cuda_buf[device], 
+        n0->cuda_buf[device], 
+        z0->cuda_buf[device], 
         emb_out->shape[1], hidden0->shape[1],
         3
       );
       CHECK_CUDA(cudaGetLastError());
-      CHECK_CUDA(cudaMemcpy(hidden0->cuda_buf, z0->cuda_buf, BATCH_SIZE * HIDDEN_DIM * sizeof(float), cudaMemcpyDeviceToDevice));
+      CHECK_CUDA(cudaMemcpy(hidden0->cuda_buf[device], z0->cuda_buf[device], BATCH_SIZE * HIDDEN_DIM * sizeof(float), cudaMemcpyDeviceToDevice));
 
       /* Second layer r */
       unified_gate_kernel<<<kernelGridDim, kernelBlockDim>>>(
-        hidden0->cuda_buf, hidden1->cuda_buf, nullptr,
-        W_ir1->cuda_buf, W_hr1->cuda_buf,
-        b_ir1->cuda_buf, b_hr1->cuda_buf,
+        hidden0->cuda_buf[device], hidden1->cuda_buf[device], nullptr,
+        W_ir1->cuda_buf[device], W_hr1->cuda_buf[device],
+        b_ir1->cuda_buf[device], b_hr1->cuda_buf[device],
         nullptr,
-        r1->cuda_buf,
+        r1->cuda_buf[device],
         hidden0->shape[1], hidden1->shape[1],
         1
       );
@@ -685,11 +685,11 @@ void namegen(int N, float *random_floats, char *output) {
 
       /* Second layer n */
       unified_gate_kernel<<<kernelGridDim, kernelBlockDim>>>(
-        hidden0->cuda_buf, hidden1->cuda_buf, r1->cuda_buf,
-        W_in1->cuda_buf, W_hn1->cuda_buf,
-        b_in1->cuda_buf, b_hn1->cuda_buf,
+        hidden0->cuda_buf[device], hidden1->cuda_buf[device], r1->cuda_buf[device],
+        W_in1->cuda_buf[device], W_hn1->cuda_buf[device],
+        b_in1->cuda_buf[device], b_hn1->cuda_buf[device],
         nullptr,
-        n1->cuda_buf,
+        n1->cuda_buf[device],
         hidden0->shape[1], hidden1->shape[1],
         2
       );
@@ -697,32 +697,32 @@ void namegen(int N, float *random_floats, char *output) {
 
       /* Second layer h (hidden) */
       unified_gate_kernel<<<kernelGridDim, kernelBlockDim>>>(
-        hidden0->cuda_buf, hidden1->cuda_buf, nullptr,
-        W_iz1->cuda_buf, W_hz1->cuda_buf,
-        b_iz1->cuda_buf, b_hz1->cuda_buf,
-        n1->cuda_buf,
-        z1->cuda_buf,
+        hidden0->cuda_buf[device], hidden1->cuda_buf[device], nullptr,
+        W_iz1->cuda_buf[device], W_hz1->cuda_buf[device],
+        b_iz1->cuda_buf[device], b_hz1->cuda_buf[device],
+        n1->cuda_buf[device],
+        z1->cuda_buf[device],
         hidden0->shape[1], hidden1->shape[1],
         3
       );
       CHECK_CUDA(cudaGetLastError());
-      CHECK_CUDA(cudaMemcpy(hidden1->cuda_buf, z1->cuda_buf, BATCH_SIZE * HIDDEN_DIM * sizeof(float), cudaMemcpyDeviceToDevice));
+      CHECK_CUDA(cudaMemcpy(hidden1->cuda_buf[device], z1->cuda_buf[device], BATCH_SIZE * HIDDEN_DIM * sizeof(float), cudaMemcpyDeviceToDevice));
       
       /* Fully connected layer */
-      matmul_kernel<<<FcGridDim, FcBlockDim>>>(hidden1->cuda_buf, W_fc->cuda_buf, b_fc->cuda_buf, ftmp0->cuda_buf, BATCH_SIZE, NUM_CHAR, HIDDEN_DIM);
+      matmul_kernel<<<FcGridDim, FcBlockDim>>>(hidden1->cuda_buf[device], W_fc->cuda_buf[device], b_fc->cuda_buf[device], ftmp0->cuda_buf[device], BATCH_SIZE, NUM_CHAR, HIDDEN_DIM);
       CHECK_CUDA(cudaGetLastError());
 
       /* softmax */
-      reduce_exp_sum_kernel<<<reduceGridDim, reduceBlockDim, NUM_CHAR * sizeof(float), 0>>>(ftmp0->cuda_buf, red_exp_out->cuda_buf, NUM_CHAR);
+      reduce_exp_sum_kernel<<<reduceGridDim, reduceBlockDim, NUM_CHAR * sizeof(float), 0>>>(ftmp0->cuda_buf[device], red_exp_out->cuda_buf[device], NUM_CHAR);
       CHECK_CUDA(cudaGetLastError());
-      elementwise_divide_kernel<<<reduceGridDim, reduceBlockDim>>>(ftmp0->cuda_buf, red_exp_out->cuda_buf, char_prob->cuda_buf, NUM_CHAR);
+      elementwise_divide_kernel<<<reduceGridDim, reduceBlockDim>>>(ftmp0->cuda_buf[device], red_exp_out->cuda_buf[device], char_prob->cuda_buf[device], NUM_CHAR);
       CHECK_CUDA(cudaGetLastError());
 
       /* random select */
-      random_select_kernel<<<randomGridDim, randomBlockDim>>>(char_prob->cuda_buf, rfloats->cuda_buf, output_cuda, input->cuda_buf, n*BATCH_SIZE, l, NUM_CHAR);
+      random_select_kernel<<<randomGridDim, randomBlockDim>>>(char_prob->cuda_buf[device], rfloats->cuda_buf[device], output_cuda, input->cuda_buf[device], device*BATCH_SIZE, l, NUM_CHAR);
     }
+    CHECK_CUDA(cudaMemcpy(output + device * BATCH_SIZE * (MAX_LEN+1), output_cuda, BATCH_SIZE * (MAX_LEN + 1) * sizeof(char), cudaMemcpyDeviceToHost));
   }
-  CHECK_CUDA(cudaMemcpy(output, output_cuda, N * (MAX_LEN + 1), cudaMemcpyDeviceToHost));
 }
 
 /*
