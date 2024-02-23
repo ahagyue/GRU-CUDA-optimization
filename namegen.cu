@@ -113,15 +113,7 @@ Tensor *rfloats;
 /* input, activations, output */
 Tensor *input, *emb_out;
 Tensor *hidden0, *hidden1;
-Tensor *r0, *r1, *z0, *z1, *n0, *n1, *f, *char_prob;
-Tensor *rtmp00, *rtmp01, *rtmp02, *rtmp03, *rtmp04;
-Tensor *rtmp10, *rtmp11, *rtmp12, *rtmp13, *rtmp14;
-Tensor *ztmp00, *ztmp01, *ztmp02, *ztmp03, *ztmp04;
-Tensor *ztmp10, *ztmp11, *ztmp12, *ztmp13, *ztmp14;
-Tensor *ntmp00, *ntmp01, *ntmp02, *ntmp03, *ntmp04, *ntmp05;
-Tensor *ntmp10, *ntmp11, *ntmp12, *ntmp13, *ntmp14, *ntmp15;
-Tensor *htmp00, *htmp01, *htmp02;
-Tensor *htmp10, *htmp11, *htmp12;
+Tensor *r0, *r1, *z0, *z1, *n0, *n1, *f, *red_exp_out, *char_prob;
 Tensor *ftmp0;
 
 /* Operations */
@@ -138,40 +130,244 @@ __global__ void embedding1(const float *input, const float *weight, float *outpu
   output[row * EMBEDDING_DIM + col] = weight[((int)input[row]) * EMBEDDING_DIM + col];
 }
 
+// /*
+//  * Reset Gate Kernel
+//  */
+// __global__ void reset_gate_kernel(const float *x, const float *h, const float *wx, const float *wh, const float *bx, const float *bh, float *output, int width_x, int width_h) {
+//   int gj = blockIdx.x, gi = blockIdx.y;
+//   int lj = threadIdx.x, li = threadIdx.y;
+
+//   int col = gj * blockDim.x + lj;
+//   int row = gi * blockDim.y + li;
+
+//   __shared__ float xlocal[BLOCK_SIZE][BLOCK_SIZE+SHM_PADDING];
+//   __shared__ float wxlocal[BLOCK_SIZE][BLOCK_SIZE+SHM_PADDING];
+//   __shared__ float hlocal[BLOCK_SIZE][BLOCK_SIZE+SHM_PADDING];
+//   __shared__ float whlocal[BLOCK_SIZE][BLOCK_SIZE+SHM_PADDING];
+
+//   float sum = bx[col] + bh[col];
+//   if (width_x == width_h) {
+//     for(int i = 0; i < width_x; i += BLOCK_SIZE) {
+//       xlocal[li][lj] = x[(row) * width_x + (i + lj)];
+//       wxlocal[li][lj] = wx[(gj*BLOCK_SIZE+li) * width_x + (i+lj)];
+//       hlocal[li][lj] = h[(row) * width_h + (i + lj)];
+//       whlocal[li][lj] = wh[(gj*BLOCK_SIZE+li) * width_h + (i+lj)];
+
+//       __syncthreads();
+
+//       for(int j = 0; j < BLOCK_SIZE; j++) {
+//         sum += xlocal[li][j] * wxlocal[lj][j] + hlocal[li][j] * whlocal[lj][j];
+//       }
+//       __syncthreads();
+//     }
+//   } else {
+//     for(int i = 0; i < width_x; i += BLOCK_SIZE) {
+//       xlocal[li][lj] = x[(row) * width_x + (i + lj)];
+//       wxlocal[li][lj] = wx[(gj*BLOCK_SIZE+li) * width_x + (i+lj)];
+      
+//       __syncthreads();
+
+//       for(int j = 0; j < BLOCK_SIZE; j++) {
+//         sum += xlocal[li][j] * wxlocal[lj][j];
+//       }
+//       __syncthreads();
+//     }
+//     for (int i = 0; i < width_h; i += BLOCK_SIZE) {
+//       hlocal[li][lj] = h[(row) * width_h + (i + lj)];
+//       whlocal[li][lj] = wh[(gj*BLOCK_SIZE+li) * width_h + (i+lj)];
+
+//       __syncthreads();
+
+//       for(int j = 0; j < BLOCK_SIZE; j++) {
+//         sum += hlocal[li][j] * whlocal[lj][j];
+//       }
+//       __syncthreads();
+//     }
+//   }
+
+//   output[row * HIDDEN_DIM + col] = 1.0 / (1.0 + expf(-sum));
+// }
+
+// /*
+//  * Candidate Gate Kernel
+//  */
+// __global__ void candidate_gate_kernel(const float *x, const float *h, const float *r, const float *wx, const float *wrh, const float *bx, const float *bh, float *output, int width_x, int width_h) {
+//   int gj = blockIdx.x, gi = blockIdx.y;
+//   int lj = threadIdx.x, li = threadIdx.y;
+
+//   int col = gj * blockDim.x + lj;
+//   int row = gi * blockDim.y + li;
+
+//   __shared__ float xlocal[BLOCK_SIZE][BLOCK_SIZE+SHM_PADDING];
+//   __shared__ float wxlocal[BLOCK_SIZE][BLOCK_SIZE+SHM_PADDING];
+//   __shared__ float hlocal[BLOCK_SIZE][BLOCK_SIZE+SHM_PADDING];
+//   __shared__ float wrhlocal[BLOCK_SIZE][BLOCK_SIZE+SHM_PADDING];
+
+//   float _r = r[row * width_h + col];
+
+//   float sum = 0;
+//   if (width_x == width_h) {
+//     for(int i = 0; i < width_x; i += BLOCK_SIZE) {
+//       xlocal[li][lj] = x[(row) * width_x + (i + lj)];
+//       wxlocal[li][lj] = wx[(gj*BLOCK_SIZE+li) * width_x + (i+lj)];
+//       hlocal[li][lj] = h[(row) * width_h + (i + lj)];
+//       wrhlocal[li][lj] = wrh[(gj*BLOCK_SIZE+li) * width_h + (i+lj)];
+
+//       __syncthreads();
+
+//       for(int j = 0; j < BLOCK_SIZE; j++) {
+//         sum += xlocal[li][j] * wxlocal[lj][j] + _r * hlocal[li][j] * wrhlocal[lj][j];
+//       }
+//       __syncthreads();
+//     }
+//   } else {
+//     for(int i = 0; i < width_x; i += BLOCK_SIZE) {
+//       xlocal[li][lj] = x[(row) * width_x + (i + lj)];
+//       wxlocal[li][lj] = wx[(gj*BLOCK_SIZE+li) * width_x + (i+lj)];
+      
+//       __syncthreads();
+
+//       for(int j = 0; j < BLOCK_SIZE; j++) {
+//         sum += xlocal[li][j] * wxlocal[lj][j];
+//       }
+//       __syncthreads();
+//     }
+//     for (int i = 0; i < width_h; i += BLOCK_SIZE) {
+//       hlocal[li][lj] = h[(row) * width_h + (i + lj)];
+//       wrhlocal[li][lj] = wrh[(gj*BLOCK_SIZE+li) * width_h + (i+lj)];
+
+//       __syncthreads();
+
+//       for(int j = 0; j < BLOCK_SIZE; j++) {
+//         sum += _r * hlocal[li][j] * wrhlocal[lj][j];
+//       }
+//       __syncthreads();
+//     }
+//   }
+//   output[row * HIDDEN_DIM + col] = tanhf(sum + bx[col] + r[row * width_h + col] * bh[col]);
+// }
+
+// /*
+//  * Final Gate Kernel
+//  */
+//  __global__ void final_gate_kernel(
+//   const float *x, const float *h,
+//   const float *wx, const float *wh,
+//   const float *bx, const float *bh,
+//   const float *g,
+//   float *output,
+//   int width_x, int width_h
+// ) {
+//   int gj = blockIdx.x, gi = blockIdx.y;
+//   int lj = threadIdx.x, li = threadIdx.y;
+
+//   int col = gj * blockDim.x + lj;
+//   int row = gi * blockDim.y + li;
+
+//   __shared__ float xlocal[BLOCK_SIZE][BLOCK_SIZE+SHM_PADDING];
+//   __shared__ float wxlocal[BLOCK_SIZE][BLOCK_SIZE+SHM_PADDING];
+//   __shared__ float hlocal[BLOCK_SIZE][BLOCK_SIZE+SHM_PADDING];
+//   __shared__ float whlocal[BLOCK_SIZE][BLOCK_SIZE+SHM_PADDING];
+
+//   float sum = bx[col] + bh[col];
+//   if (width_x == width_h) {
+//     for(int i = 0; i < width_x; i += BLOCK_SIZE) {
+//       xlocal[li][lj] = x[(row) * width_x + (i + lj)];
+//       wxlocal[li][lj] = wx[(gj*BLOCK_SIZE+li) * width_x + (i+lj)];
+//       hlocal[li][lj] = h[(row) * width_h + (i + lj)];
+//       whlocal[li][lj] = wh[(gj*BLOCK_SIZE+li) * width_h + (i+lj)];
+
+//       __syncthreads();
+
+//       for(int j = 0; j < BLOCK_SIZE; j++) {
+//         sum += xlocal[li][j] * wxlocal[lj][j] + hlocal[li][j] * whlocal[lj][j];
+//       }
+//       __syncthreads();
+//     }
+//   } else {
+//     for(int i = 0; i < width_x; i += BLOCK_SIZE) {
+//       xlocal[li][lj] = x[(row) * width_x + (i + lj)];
+//       wxlocal[li][lj] = wx[(gj*BLOCK_SIZE+li) * width_x + (i+lj)];
+      
+//       __syncthreads();
+
+//       for(int j = 0; j < BLOCK_SIZE; j++) {
+//         sum += xlocal[li][j] * wxlocal[lj][j];
+//       }
+//       __syncthreads();
+//     }
+//     for (int i = 0; i < width_h; i += BLOCK_SIZE) {
+//       hlocal[li][lj] = h[(row) * width_h + (i + lj)];
+//       whlocal[li][lj] = wh[(gj*BLOCK_SIZE+li) * width_h + (i+lj)];
+
+//       __syncthreads();
+
+//       for(int j = 0; j < BLOCK_SIZE; j++) {
+//         sum += hlocal[li][j] * whlocal[lj][j];
+//       }
+//       __syncthreads();
+//     }
+//   }
+//   int pos = row * HIDDEN_DIM + col;
+//   output[pos] = g[pos] + (h[pos] - g[pos]) * (1.0 / (1.0 + expf(-sum)));
+// }
+
 /*
- * Reset Gate Kernel
+ * Unified Gate Kernel
  */
-__global__ void reset_gate_kernel(const float *x, const float *h, const float *wx, const float *wh, const float *bx, const float *bh, float *output, int width_x, int width_h) {
+ __global__ void unified_gate_kernel(
+  const float *x, const float *h, const float *r,
+  const float *wx, const float *wh,
+  const float *bx, const float *bh,
+  const float *g,
+  float *output,
+  int width_x, int width_h,
+  int type
+) {
   int gj = blockIdx.x, gi = blockIdx.y;
   int lj = threadIdx.x, li = threadIdx.y;
+  int x = lj % FV_PER_BLOCK * 4, y = li * 4 + lj / FV_PER_BLOCK;
+  int col = gj * blockDim.x + x, row = gi * blockDim.y + y;
+  int _col = 4 * lj, _row = 4 * li;
 
-  int col = gj * blockDim.x + lj;
-  int row = gi * blockDim.y + li;
+  float _r = type == 2 ? r[row * width_h + col] : 1.0f;
 
-  __shared__ float xlocal[BLOCK_SIZE][BLOCK_SIZE+SHM_PADDING];
-  __shared__ float wxlocal[BLOCK_SIZE][BLOCK_SIZE+SHM_PADDING];
-  __shared__ float hlocal[BLOCK_SIZE][BLOCK_SIZE+SHM_PADDING];
-  __shared__ float whlocal[BLOCK_SIZE][BLOCK_SIZE+SHM_PADDING];
+  __shared__ float xlocal[BLOCK_SIZE*4][BLOCK_SIZE+SHM_PADDING];
+  __shared__ float wxlocal[BLOCK_SIZE*4][BLOCK_SIZE+SHM_PADDING];
+  __shared__ float hlocal[BLOCK_SIZE*4][BLOCK_SIZE+SHM_PADDING];
+  __shared__ float whlocal[BLOCK_SIZE*4][BLOCK_SIZE+SHM_PADDING];
 
-  float sum = bx[col] + bh[col];
+  float4 sum[4] = {make_float4(bx[col] + _r * bh[col]), };
   if (width_x == width_h) {
     for(int i = 0; i < width_x; i += BLOCK_SIZE) {
-      xlocal[li][lj] = x[(row) * width_x + (i + lj)];
-      wxlocal[li][lj] = wx[(gj*BLOCK_SIZE+li) * width_x + (i+lj)];
-      hlocal[li][lj] = h[(row) * width_h + (i + lj)];
-      whlocal[li][lj] = wh[(gj*BLOCK_SIZE+li) * width_h + (i+lj)];
+      float4 x4 = *(float4*)(&x[(row) * width_x + (i + x)]);
+      float4 wx4 = *(float4*)(&wx[(gj*BLOCK_SIZE+y) * width_x + (i+x)]);
+      float4 h4 = *(float4*)(&h[(row) * width_h + (i + lj * 4)]);
+      float4 wh4 = *(float4*)(&wh[(gj*BLOCK_SIZE+y) * width_h + (i+x)]);
+      for(int vec_i = 0; vec_i < 4; vec_i++) {
+        xlocal[y][x+vec_i] = ((float*)(&x4))[vec_i];
+        wxlocal[y][x+vec_i] = ((float*)(&wx4))[vec_i];
+        hlocal[y][x+vec_i] = ((float*)(&h4))[vec_i];
+        whlocal[y][x+vec_i] = ((float*)(&wh4))[vec_i];
+      }
 
       __syncthreads();
 
       for(int j = 0; j < BLOCK_SIZE; j++) {
-        sum += xlocal[li][j] * wxlocal[lj][j] + hlocal[li][j] * whlocal[lj][j];
+
+        if (type == 2) sum += xlocal[_row][j] * wxlocal[_col][j] + _r * hlocal[_row][j] * whlocal[_col][j];
+        else sum += xlocal[_row][j] * wxlocal[_col][j] + hlocal[_row][j] * whlocal[_col][j];
       }
       __syncthreads();
     }
   } else {
     for(int i = 0; i < width_x; i += BLOCK_SIZE) {
-      xlocal[li][lj] = x[(row) * width_x + (i + lj)];
-      wxlocal[li][lj] = wx[(gj*BLOCK_SIZE+li) * width_x + (i+lj)];
+      float4 x4 = *(float4*)(&x[(row) * width_x + (i + lj * 4)]);
+      float4 wx4 = *(float4*)(&wx[(gj*BLOCK_SIZE+li) * width_x + (i+lj * 4)]);
+      for(int vec_i = 0; vec_i < 4; vec_i++) {
+        xlocal[li][lj*4+vec_i] = ((float*)(&x4))[vec_i];
+        wxlocal[li][lj*4+vec_i] = ((float*)(&wx4))[vec_i];
+      }
       
       __syncthreads();
 
@@ -181,136 +377,29 @@ __global__ void reset_gate_kernel(const float *x, const float *h, const float *w
       __syncthreads();
     }
     for (int i = 0; i < width_h; i += BLOCK_SIZE) {
-      hlocal[li][lj] = h[(row) * width_h + (i + lj)];
-      whlocal[li][lj] = wh[(gj*BLOCK_SIZE+li) * width_h + (i+lj)];
-
-      __syncthreads();
-
-      for(int j = 0; j < BLOCK_SIZE; j++) {
-        sum += hlocal[li][j] * whlocal[lj][j];
+      float4 h4 = *(float4*)(&h[(row) * width_x + (i + lj * 4)]);
+      float4 wh4 = *(float4*)(&wh[(gj*BLOCK_SIZE+li) * width_x + (i+lj * 4)]);
+      for(int vec_i = 0; vec_i < 4; vec_i++) {
+        hlocal[li][lj*4+vec_i] = ((float*)(&h4))[vec_i];
+        whlocal[li][lj*4+vec_i] = ((float*)(&wh4))[vec_i];
       }
-      __syncthreads();
-    }
-  }
-
-  output[row * HIDDEN_DIM + col] = 1.0 / (1.0 + expf(-sum));
-}
-
-/*
- * Candidate Gate Kernel
- */
-__global__ void candidate_gate_kernel(const float *x, const float *h, const float *r, const float *wx, const float *wrh, const float *bx, const float *bh, float *output, int width_x, int width_h) {
-  int gj = blockIdx.x, gi = blockIdx.y;
-  int lj = threadIdx.x, li = threadIdx.y;
-
-  int col = gj * blockDim.x + lj;
-  int row = gi * blockDim.y + li;
-
-  __shared__ float xlocal[BLOCK_SIZE][BLOCK_SIZE+SHM_PADDING];
-  __shared__ float wxlocal[BLOCK_SIZE][BLOCK_SIZE+SHM_PADDING];
-  __shared__ float hlocal[BLOCK_SIZE][BLOCK_SIZE+SHM_PADDING];
-  __shared__ float wrhlocal[BLOCK_SIZE][BLOCK_SIZE+SHM_PADDING];
-
-  float _r = r[row * width_h + col];
-
-  float sum = 0;
-  if (width_x == width_h) {
-    for(int i = 0; i < width_x; i += BLOCK_SIZE) {
-      xlocal[li][lj] = x[(row) * width_x + (i + lj)];
-      wxlocal[li][lj] = wx[(gj*BLOCK_SIZE+li) * width_x + (i+lj)];
-      hlocal[li][lj] = h[(row) * width_h + (i + lj)];
-      wrhlocal[li][lj] = wrh[(gj*BLOCK_SIZE+li) * width_h + (i+lj)];
 
       __syncthreads();
 
       for(int j = 0; j < BLOCK_SIZE; j++) {
-        sum += xlocal[li][j] * wxlocal[lj][j] + _r * hlocal[li][j] * wrhlocal[lj][j];
-      }
-      __syncthreads();
-    }
-  } else {
-    for(int i = 0; i < width_x; i += BLOCK_SIZE) {
-      xlocal[li][lj] = x[(row) * width_x + (i + lj)];
-      wxlocal[li][lj] = wx[(gj*BLOCK_SIZE+li) * width_x + (i+lj)];
-      
-      __syncthreads();
-
-      for(int j = 0; j < BLOCK_SIZE; j++) {
-        sum += xlocal[li][j] * wxlocal[lj][j];
-      }
-      __syncthreads();
-    }
-    for (int i = 0; i < width_h; i += BLOCK_SIZE) {
-      hlocal[li][lj] = h[(row) * width_h + (i + lj)];
-      wrhlocal[li][lj] = wrh[(gj*BLOCK_SIZE+li) * width_h + (i+lj)];
-
-      __syncthreads();
-
-      for(int j = 0; j < BLOCK_SIZE; j++) {
-        sum += _r * hlocal[li][j] * wrhlocal[lj][j];
-      }
-      __syncthreads();
-    }
-  }
-  output[row * HIDDEN_DIM + col] = tanhf(sum + bx[col] + r[row * width_h + col] * bh[col]);
-}
-
-/*
- * Final Gate Kernel
- */
- __global__ void final_gate_kernel(const float *x, const float *h, const float *wx, const float *wh, const float *bx, const float *bh, const float *g, float *output, int width_x, int width_h) {
-  int gj = blockIdx.x, gi = blockIdx.y;
-  int lj = threadIdx.x, li = threadIdx.y;
-
-  int col = gj * blockDim.x + lj;
-  int row = gi * blockDim.y + li;
-
-  __shared__ float xlocal[BLOCK_SIZE][BLOCK_SIZE+SHM_PADDING];
-  __shared__ float wxlocal[BLOCK_SIZE][BLOCK_SIZE+SHM_PADDING];
-  __shared__ float hlocal[BLOCK_SIZE][BLOCK_SIZE+SHM_PADDING];
-  __shared__ float whlocal[BLOCK_SIZE][BLOCK_SIZE+SHM_PADDING];
-
-  float sum = bx[col] + bh[col];
-  if (width_x == width_h) {
-    for(int i = 0; i < width_x; i += BLOCK_SIZE) {
-      xlocal[li][lj] = x[(row) * width_x + (i + lj)];
-      wxlocal[li][lj] = wx[(gj*BLOCK_SIZE+li) * width_x + (i+lj)];
-      hlocal[li][lj] = h[(row) * width_h + (i + lj)];
-      whlocal[li][lj] = wh[(gj*BLOCK_SIZE+li) * width_h + (i+lj)];
-
-      __syncthreads();
-
-      for(int j = 0; j < BLOCK_SIZE; j++) {
-        sum += xlocal[li][j] * wxlocal[lj][j] + hlocal[li][j] * whlocal[lj][j];
-      }
-      __syncthreads();
-    }
-  } else {
-    for(int i = 0; i < width_x; i += BLOCK_SIZE) {
-      xlocal[li][lj] = x[(row) * width_x + (i + lj)];
-      wxlocal[li][lj] = wx[(gj*BLOCK_SIZE+li) * width_x + (i+lj)];
-      
-      __syncthreads();
-
-      for(int j = 0; j < BLOCK_SIZE; j++) {
-        sum += xlocal[li][j] * wxlocal[lj][j];
-      }
-      __syncthreads();
-    }
-    for (int i = 0; i < width_h; i += BLOCK_SIZE) {
-      hlocal[li][lj] = h[(row) * width_h + (i + lj)];
-      whlocal[li][lj] = wh[(gj*BLOCK_SIZE+li) * width_h + (i+lj)];
-
-      __syncthreads();
-
-      for(int j = 0; j < BLOCK_SIZE; j++) {
-        sum += hlocal[li][j] * whlocal[lj][j];
+        if (type == 2) sum += _r * hlocal[li][j] * whlocal[lj][j];
+        else sum += hlocal[li][j] * whlocal[lj][j];
       }
       __syncthreads();
     }
   }
   int pos = row * HIDDEN_DIM + col;
-  output[pos] = g[pos] + (h[pos] - g[pos]) * (1.0 / (1.0 + expf(-sum)));
+  if (type == 1)
+    output[pos] = 1.0 / (1.0 + expf(-sum));
+  else if (type == 2)
+    output[pos] =  tanhf(sum);
+  else
+    output[pos] = g[pos] + (h[pos] - g[pos]) * (1.0 / (1.0 + expf(-sum)));
 }
 
 /*
@@ -344,8 +433,53 @@ __global__ void matmul_kernel(const float *x , const float *w, const float *b, f
 /*
  * Reduce Sum of Exponent
  */
-__global__ void reduce_exp_sum_kernel(float *input, float *output) {
+__global__ void reduce_exp_sum_kernel(const float *input, float *output, int width) {
+  extern __shared__ double L[];
 
+  unsigned int batch = blockIdx.x;
+  unsigned int tid = threadIdx.x;
+  unsigned int stride = blockDim.x;
+
+  L[tid] = 0;
+  L[tid] += expf(input[batch * width + tid]);
+  L[tid] += expf(input[batch * width + tid + stride]);
+
+  __syncthreads();
+
+  for(stride = blockDim.x / 2; stride > 0; stride /=2) {
+    if (tid < stride) L[tid] += L[tid+stride];
+    __syncthreads();
+  }
+
+  if (tid == 0) output[batch] = L[0];
+}
+
+/*
+ * Elementwise division
+ */
+__global__ void elementwise_divide_kernel(const float *dividend, const float *divisor, float *output, int width) {
+  unsigned int batch = blockIdx.x;
+  unsigned int tid = threadIdx.x;
+  output[batch * width + tid] = expf(dividend[batch * width + tid]) / divisor[batch];
+}
+
+/*
+ * Random select kernel
+ */
+__global__ void random_select_kernel(const float *input, const float *rng_seq, char *output1, float *output2, int output_offset, int offset, int width) {
+  unsigned int batch = blockIdx.x * blockDim.x + threadIdx.x;
+  float r = rng_seq[(batch + output_offset) * MAX_LEN + offset];
+  float psum = 0.0;
+  for (size_t i = 0; i < width; i++) {
+    psum += input[batch * width + i];
+    if (psum > r) {
+      output1[(batch + output_offset) * (MAX_LEN + 1) + offset] =  (char)i;
+      output2[batch] = (float)i;
+      return;
+    }
+  }
+  output1[(batch + output_offset) * (MAX_LEN + 1) + offset] = (char)width-1;
+  output2[batch] = (float)width-1;
 }
 
 /*
@@ -455,6 +589,7 @@ void namegen_initialize(int N, char *parameter_fname) {
 
   rfloats = new Tensor({N * MAX_LEN});
   ftmp0 = new Tensor({BATCH_SIZE, NUM_CHAR});
+  red_exp_out = new Tensor({BATCH_SIZE});
   char_prob = new Tensor({BATCH_SIZE, NUM_CHAR});
 }
 
@@ -468,6 +603,20 @@ void namegen_initialize(int N, char *parameter_fname) {
 void namegen(int N, float *random_floats, char *output) {
   CHECK_CUDA(cudaMemcpy(rfloats->cuda_buf, random_floats, N * MAX_LEN * sizeof(float), cudaMemcpyHostToDevice));
   memset(output, 0, N * (MAX_LEN + 1) * sizeof(char));
+  char *output_cuda;
+  CHECK_CUDA(cudaMalloc(&output_cuda, N * (MAX_LEN+1) * sizeof(char)));
+  CHECK_CUDA(cudaMemset(output_cuda, 0, N * (MAX_LEN+1) * sizeof(char)));
+
+  dim3 embGridDim(EMBEDDING_DIM / EMBEDDING_PAR, BATCH_SIZE / E_BATCH_PAR);
+  dim3 embBlockDim(EMBEDDING_PAR, E_BATCH_PAR);
+  dim3 kernelGridDim(HIDDEN_DIM / M_BLOCK_SIZE, BATCH_SIZE / N_BLOCK_SIZE);
+  dim3 kernelBlockDim(BLOCK_SIZE, BLOCK_SIZE);
+  dim3 FcGridDim(NUM_CHAR / BLOCK_SIZE, BATCH_SIZE / BLOCK_SIZE);
+  dim3 FcBlockDim(BLOCK_SIZE, BLOCK_SIZE);
+  dim3 reduceGridDim(BATCH_SIZE);
+  dim3 reduceBlockDim(NUM_CHAR/2);
+  dim3 randomGridDim(BATCH_SIZE / R_BATCH_PAR);
+  dim3 randomBlockDim(R_BATCH_PAR);
 
   /* Generate N names */
   int batched_N = (N + BATCH_SIZE - 1) / BATCH_SIZE;
@@ -482,70 +631,98 @@ void namegen(int N, float *random_floats, char *output) {
 
     for (int l = 0; l < MAX_LEN; l++) {
       /* Embedding */
-      dim3 gridDim(EMBEDDING_DIM / EMBEDDING_PAR, BATCH_SIZE / E_BATCH_PAR);
-      dim3 blockDim(EMBEDDING_PAR, E_BATCH_PAR);
-      embedding1<<<gridDim, blockDim>>>(input->cuda_buf, character_embedding->cuda_buf, emb_out->cuda_buf);
+      embedding1<<<embGridDim, embBlockDim>>>(input->cuda_buf, character_embedding->cuda_buf, emb_out->cuda_buf);
       CHECK_CUDA(cudaGetLastError());
 
       /* First layer r */
-      gridDim = dim3(HIDDEN_DIM / BLOCK_SIZE, BATCH_SIZE / BLOCK_SIZE);
-      blockDim = dim3(BLOCK_SIZE, BLOCK_SIZE);
-      reset_gate_kernel<<<gridDim, blockDim>>>(emb_out->cuda_buf, hidden0->cuda_buf, W_ir0->cuda_buf, W_hr0->cuda_buf, b_ir0->cuda_buf, b_hr0->cuda_buf, r0->cuda_buf, emb_out->shape[1], hidden0->shape[1]);
+      unified_gate_kernel<<<kernelGridDim, kernelBlockDim>>>(
+        emb_out->cuda_buf, hidden0->cuda_buf, nullptr,
+        W_ir0->cuda_buf, W_hr0->cuda_buf,
+        b_ir0->cuda_buf, b_hr0->cuda_buf,
+        nullptr,
+        r0->cuda_buf,
+        emb_out->shape[1], hidden0->shape[1],
+        1
+      );
       CHECK_CUDA(cudaGetLastError());
 
       /* First layer n */
-      gridDim = dim3(HIDDEN_DIM / BLOCK_SIZE, BATCH_SIZE / BLOCK_SIZE);
-      blockDim = dim3(BLOCK_SIZE, BLOCK_SIZE);
-      candidate_gate_kernel<<<gridDim, blockDim>>>(emb_out->cuda_buf, hidden0->cuda_buf, r0->cuda_buf, W_in0->cuda_buf, W_hn0->cuda_buf, b_in0->cuda_buf, b_hn0->cuda_buf, n0->cuda_buf, emb_out->shape[1], hidden0->shape[1]);
+      unified_gate_kernel<<<kernelGridDim, kernelBlockDim>>>(
+        emb_out->cuda_buf, hidden0->cuda_buf, r0->cuda_buf,
+        W_in0->cuda_buf, W_hn0->cuda_buf,
+        b_in0->cuda_buf, b_hn0->cuda_buf,
+        nullptr,
+        n0->cuda_buf,
+        emb_out->shape[1], hidden0->shape[1],
+        2 
+      );
       CHECK_CUDA(cudaGetLastError());
 
       /* First layer h (hidden) */
-      gridDim = dim3(HIDDEN_DIM / BLOCK_SIZE, BATCH_SIZE / BLOCK_SIZE);
-      blockDim = dim3(BLOCK_SIZE, BLOCK_SIZE);
-      final_gate_kernel<<<gridDim, blockDim>>>(emb_out->cuda_buf, hidden0->cuda_buf, W_iz0->cuda_buf, W_hz0->cuda_buf, b_iz0->cuda_buf, b_hz0->cuda_buf, n0->cuda_buf, z0->cuda_buf, emb_out->shape[1], hidden0->shape[1]);
+      unified_gate_kernel<<<kernelGridDim, kernelBlockDim>>>(
+        emb_out->cuda_buf, hidden0->cuda_buf, nullptr,
+        W_iz0->cuda_buf, W_hz0->cuda_buf, 
+        b_iz0->cuda_buf, b_hz0->cuda_buf, 
+        n0->cuda_buf, 
+        z0->cuda_buf, 
+        emb_out->shape[1], hidden0->shape[1],
+        3
+      );
       CHECK_CUDA(cudaGetLastError());
       CHECK_CUDA(cudaMemcpy(hidden0->cuda_buf, z0->cuda_buf, BATCH_SIZE * HIDDEN_DIM * sizeof(float), cudaMemcpyDeviceToDevice));
 
       /* Second layer r */
-      gridDim = dim3(HIDDEN_DIM / BLOCK_SIZE, BATCH_SIZE / BLOCK_SIZE);
-      blockDim = dim3(BLOCK_SIZE, BLOCK_SIZE);
-      reset_gate_kernel<<<gridDim, blockDim>>>(hidden0->cuda_buf, hidden1->cuda_buf, W_ir1->cuda_buf, W_hr1->cuda_buf, b_ir1->cuda_buf, b_hr1->cuda_buf, r1->cuda_buf, hidden0->shape[1], hidden1->shape[1]);
+      unified_gate_kernel<<<kernelGridDim, kernelBlockDim>>>(
+        hidden0->cuda_buf, hidden1->cuda_buf, nullptr,
+        W_ir1->cuda_buf, W_hr1->cuda_buf,
+        b_ir1->cuda_buf, b_hr1->cuda_buf,
+        nullptr,
+        r1->cuda_buf,
+        hidden0->shape[1], hidden1->shape[1],
+        1
+      );
       CHECK_CUDA(cudaGetLastError());
 
       /* Second layer n */
-      gridDim = dim3(HIDDEN_DIM / BLOCK_SIZE, BATCH_SIZE / BLOCK_SIZE);
-      blockDim = dim3(BLOCK_SIZE, BLOCK_SIZE);
-      candidate_gate_kernel<<<gridDim, blockDim>>>(hidden0->cuda_buf, hidden1->cuda_buf, r1->cuda_buf, W_in1->cuda_buf, W_hn1->cuda_buf, b_in1->cuda_buf, b_hn1->cuda_buf, n1->cuda_buf, hidden0->shape[1], hidden1->shape[1]);
+      unified_gate_kernel<<<kernelGridDim, kernelBlockDim>>>(
+        hidden0->cuda_buf, hidden1->cuda_buf, r1->cuda_buf,
+        W_in1->cuda_buf, W_hn1->cuda_buf,
+        b_in1->cuda_buf, b_hn1->cuda_buf,
+        nullptr,
+        n1->cuda_buf,
+        hidden0->shape[1], hidden1->shape[1],
+        2
+      );
       CHECK_CUDA(cudaGetLastError());
 
       /* Second layer h (hidden) */
-      gridDim = dim3(HIDDEN_DIM / BLOCK_SIZE, BATCH_SIZE / BLOCK_SIZE);
-      blockDim = dim3(BLOCK_SIZE, BLOCK_SIZE);
-      final_gate_kernel<<<gridDim, blockDim>>>(hidden0->cuda_buf, hidden1->cuda_buf, W_iz1->cuda_buf, W_hz1->cuda_buf, b_iz1->cuda_buf, b_hz1->cuda_buf, n1->cuda_buf, z1->cuda_buf, hidden0->shape[1], hidden1->shape[1]);
+      unified_gate_kernel<<<kernelGridDim, kernelBlockDim>>>(
+        hidden0->cuda_buf, hidden1->cuda_buf, nullptr,
+        W_iz1->cuda_buf, W_hz1->cuda_buf,
+        b_iz1->cuda_buf, b_hz1->cuda_buf,
+        n1->cuda_buf,
+        z1->cuda_buf,
+        hidden0->shape[1], hidden1->shape[1],
+        3
+      );
       CHECK_CUDA(cudaGetLastError());
       CHECK_CUDA(cudaMemcpy(hidden1->cuda_buf, z1->cuda_buf, BATCH_SIZE * HIDDEN_DIM * sizeof(float), cudaMemcpyDeviceToDevice));
       
       /* Fully connected layer */
-      gridDim = dim3(NUM_CHAR / BLOCK_SIZE, BATCH_SIZE / BLOCK_SIZE);
-      blockDim = dim3(BLOCK_SIZE, BLOCK_SIZE);
-      matmul_kernel<<<gridDim, blockDim>>>(hidden1->cuda_buf, W_fc->cuda_buf, b_fc->cuda_buf, ftmp0->cuda_buf, BATCH_SIZE, NUM_CHAR, HIDDEN_DIM);
+      matmul_kernel<<<FcGridDim, FcBlockDim>>>(hidden1->cuda_buf, W_fc->cuda_buf, b_fc->cuda_buf, ftmp0->cuda_buf, BATCH_SIZE, NUM_CHAR, HIDDEN_DIM);
       CHECK_CUDA(cudaGetLastError());
 
-      ftmp0->to_cpu();
-      rfloats->to_cpu();
-      
-      nvtxRangeId_t cpuid = nvtx_range_start("cpu range");
-      softmax(ftmp0, char_prob);
-      for(int i = 0; i < BATCH_SIZE; i++) {
-        /* Random select */
-        int selected_char = random_select(char_prob, rfloats, (n * BATCH_SIZE + i) * MAX_LEN + l, i * NUM_CHAR);
-        output[(n * BATCH_SIZE + i) * (MAX_LEN + 1) + l] = selected_char;
-        input->buf[i] = (float)selected_char;
-      }
-      input->to_cuda();
-      nvtx_range_stop(cpuid);
+      /* softmax */
+      reduce_exp_sum_kernel<<<reduceGridDim, reduceBlockDim, NUM_CHAR * sizeof(float), 0>>>(ftmp0->cuda_buf, red_exp_out->cuda_buf, NUM_CHAR);
+      CHECK_CUDA(cudaGetLastError());
+      elementwise_divide_kernel<<<reduceGridDim, reduceBlockDim>>>(ftmp0->cuda_buf, red_exp_out->cuda_buf, char_prob->cuda_buf, NUM_CHAR);
+      CHECK_CUDA(cudaGetLastError());
+
+      /* random select */
+      random_select_kernel<<<randomGridDim, randomBlockDim>>>(char_prob->cuda_buf, rfloats->cuda_buf, output_cuda, input->cuda_buf, n*BATCH_SIZE, l, NUM_CHAR);
     }
   }
+  CHECK_CUDA(cudaMemcpy(output, output_cuda, N * (MAX_LEN + 1), cudaMemcpyDeviceToHost));
 }
 
 /*

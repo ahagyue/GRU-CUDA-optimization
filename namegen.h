@@ -13,15 +13,24 @@
 
 // embedding layer config
 #define E_BATCH_PAR 32
-#define EMBEDDING_PAR 32
+#define EMBEDDING_PAR 1
 
 // gate config
-#define BLOCK_SIZE 32
+#define BLOCK_SIZE 8
+#define FV_PER_BLOCK (BLOCK_SIZE / 4)
+#define M_BLOCK_SIZE (BLOCK_SIZE * 4)
+#define N_BLOCK_SIZE (BLOCK_SIZE * 4)
 #define SHM_PADDING 1
 
 // FC config
 #define F_CHAR_PAR 32
 #define F_BATCH_PAR 32
+
+// random select config
+#define R_BATCH_PAR 1024
+
+// shared memory size
+#define SHM_SIZE 48*1024
 
 #define OFFSET0 0
 
