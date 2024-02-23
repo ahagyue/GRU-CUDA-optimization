@@ -15,7 +15,7 @@
 #define EMBEDDING_PAR 1
 
 // gate config
-#define BLOCK_SIZE 32
+#define BLOCK_SIZE 16
 #define FV_PER_BLOCK (BLOCK_SIZE / 4)
 #define M_BLOCK_SIZE (BLOCK_SIZE * 4)
 #define N_BLOCK_SIZE (BLOCK_SIZE * 4)
