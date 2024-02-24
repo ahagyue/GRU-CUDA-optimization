@@ -19,9 +19,10 @@
 #define FV_PER_BLOCK (BLOCK_SIZE / 4)
 #define M_BLOCK_SIZE (BLOCK_SIZE * 4)
 #define N_BLOCK_SIZE (BLOCK_SIZE * 4)
-#define SHM_PADDING 1
+#define SHM_PADDING 3
 
 // FC config
+#define FC_BLOCK_SIZE 32
 #define F_CHAR_PAR 32
 #define F_BATCH_PAR 32
 
@@ -29,7 +30,7 @@
 #define R_BATCH_PAR 1024
 
 // shared memory size
-#define SHM_SIZE 48*1024
+#define SHM_SIZE ((BLOCK_SIZE+SHM_PADDING)*BLOCK_SIZE*4*4*sizeof(float)/2*3)
 
 #define OFFSET0 0
 

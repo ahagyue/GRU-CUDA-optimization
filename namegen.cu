@@ -342,17 +342,16 @@ __global__ void embedding1(const float *input, const float *weight, float *outpu
   int _col = 4 * lj, _row = 4 * li;
   int rcol = gj * M_BLOCK_SIZE + lj * 4, rrow = gi * N_BLOCK_SIZE + li * 4;
 
-  float _r[4][4] = {
-        {1.0f, 1.0f, 1.0f, 1.0f},
-        {1.0f, 1.0f, 1.0f, 1.0f},
-        {1.0f, 1.0f, 1.0f, 1.0f},
-        {1.0f, 1.0f, 1.0f, 1.0f},
+  float4 _r[4] = {
+        make_float4(1.0f, 1.0f, 1.0f, 1.0f),
+        make_float4(1.0f, 1.0f, 1.0f, 1.0f),
+        make_float4(1.0f, 1.0f, 1.0f, 1.0f),
+        make_float4(1.0f, 1.0f, 1.0f, 1.0f),
       };
   if (type == 2) {
     for(int i = 0; i < 4; i++) {
-      for(int j = 0; j < 4; j++) {
-        _r[i][j] = r[(rrow+i) * width_h + rcol+j];
-      }
+      float4 r4 = *(float4*)(&r[(rrow+i)*width_h+rcol]);
+        _r[i] = r4;
     }
   }
 
@@ -361,11 +360,13 @@ __global__ void embedding1(const float *input, const float *weight, float *outpu
   __shared__ float hlocal[BLOCK_SIZE*4][BLOCK_SIZE+SHM_PADDING];
   __shared__ float whlocal[BLOCK_SIZE*4][BLOCK_SIZE+SHM_PADDING];
 
+  float4 bx_c = *(float4*)(&bx[rcol]);
+  float4 bh_c = *(float4*)(&bh[rcol]);
   float sum[4][4] = {
-    {bx[rcol] + _r[0][0] * bh[rcol], bx[rcol+1] + _r[0][1] * bh[rcol+1], bx[rcol+2] + _r[0][2] * bh[rcol+2], bx[rcol+3] + _r[0][3] * bh[rcol+3]},
-    {bx[rcol] + _r[1][0] * bh[rcol], bx[rcol+1] + _r[1][1] * bh[rcol+1], bx[rcol+2] + _r[1][2] * bh[rcol+2], bx[rcol+3] + _r[1][3] * bh[rcol+3]},
-    {bx[rcol] + _r[2][0] * bh[rcol], bx[rcol+1] + _r[2][1] * bh[rcol+1], bx[rcol+2] + _r[2][2] * bh[rcol+2], bx[rcol+3] + _r[2][3] * bh[rcol+3]},
-    {bx[rcol] + _r[3][0] * bh[rcol], bx[rcol+1] + _r[3][1] * bh[rcol+1], bx[rcol+2] + _r[3][2] * bh[rcol+2], bx[rcol+3] + _r[3][3] * bh[rcol+3]},
+    {bx_c.x + _r[0].x * bh_c.x, bx_c.y + _r[0].y * bh_c.y, bx_c.z + _r[0].z * bh_c.z, bx_c.w + _r[0].w * bh_c.w},
+    {bx_c.x + _r[1].x * bh_c.x, bx_c.y + _r[1].y * bh_c.y, bx_c.z + _r[1].z * bh_c.z, bx_c.w + _r[1].w * bh_c.w},
+    {bx_c.x + _r[2].x * bh_c.x, bx_c.y + _r[2].y * bh_c.y, bx_c.z + _r[2].z * bh_c.z, bx_c.w + _r[2].w * bh_c.w},
+    {bx_c.x + _r[3].x * bh_c.x, bx_c.y + _r[3].y * bh_c.y, bx_c.z + _r[3].z * bh_c.z, bx_c.w + _r[3].w * bh_c.w},
   };
   if (width_x == width_h) {
     for(int i = 0; i < width_x; i += BLOCK_SIZE) {
@@ -385,7 +386,7 @@ __global__ void embedding1(const float *input, const float *weight, float *outpu
       for(int j = 0; j < BLOCK_SIZE; j++) {
         for(int grid_x = 0; grid_x < 4; grid_x++) {
           for(int grid_y = 0; grid_y < 4; grid_y++) {
-            sum[grid_y][grid_x] += xlocal[_row+grid_y][j] * wxlocal[_col+grid_x][j] + _r[grid_y][grid_x] * hlocal[_row+grid_y][j] * whlocal[_col+grid_x][j];
+            sum[grid_y][grid_x] += xlocal[_row+grid_y][j] * wxlocal[_col+grid_x][j] + ((float*)(&_r[grid_y]))[grid_x] * hlocal[_row+grid_y][j] * whlocal[_col+grid_x][j];
           }
         }
       }
@@ -425,13 +426,14 @@ __global__ void embedding1(const float *input, const float *weight, float *outpu
       for(int j = 0; j < BLOCK_SIZE; j++) {
         for(int grid_x = 0; grid_x < 4; grid_x++) {
           for(int grid_y = 0; grid_y < 4; grid_y++) {
-            sum[grid_y][grid_x] += _r[grid_y][grid_x] * hlocal[_row+grid_y][j] * whlocal[_col+grid_x][j];
+            sum[grid_y][grid_x] += ((float*)(&_r[grid_y]))[grid_x] * hlocal[_row+grid_y][j] * whlocal[_col+grid_x][j];
           }
         }
       }
       __syncthreads();
     }
   }
+  
   int pos;
     for (int i = 0; i < 4; i++) {
       for(int j = 0; j < 4; j++) {
@@ -457,17 +459,17 @@ __global__ void matmul_kernel(const float *x , const float *w, const float *b, f
   int col = gj * blockDim.x + lj;
   int row = gi * blockDim.y + li;
 
-  __shared__ float xlocal[BLOCK_SIZE][BLOCK_SIZE+SHM_PADDING];
-  __shared__ float wlocal[BLOCK_SIZE][BLOCK_SIZE+SHM_PADDING];
+  __shared__ float xlocal[FC_BLOCK_SIZE][FC_BLOCK_SIZE+SHM_PADDING];
+  __shared__ float wlocal[FC_BLOCK_SIZE][FC_BLOCK_SIZE+SHM_PADDING];
 
   float sum = b[col];
-  for(int i = 0; i < K; i+=BLOCK_SIZE) {
+  for(int i = 0; i < K; i+=FC_BLOCK_SIZE) {
     xlocal[li][lj] = x[(row) * K + (i + lj)];
-    wlocal[li][lj] = w[(gj*BLOCK_SIZE+li) * K + (i+lj)];
+    wlocal[li][lj] = w[(gj*FC_BLOCK_SIZE+li) * K + (i+lj)];
     
     __syncthreads();
 
-    for(int j = 0; j < BLOCK_SIZE; j++) {
+    for(int j = 0; j < FC_BLOCK_SIZE; j++) {
       sum += xlocal[li][j] * wlocal[lj][j];
     }
     __syncthreads();
@@ -653,8 +655,8 @@ void namegen(int N, float *random_floats, char *output) {
   dim3 embBlockDim(EMBEDDING_PAR, E_BATCH_PAR);
   dim3 kernelGridDim(HIDDEN_DIM / M_BLOCK_SIZE, BATCH_SIZE / N_BLOCK_SIZE);
   dim3 kernelBlockDim(BLOCK_SIZE, BLOCK_SIZE);
-  dim3 FcGridDim(NUM_CHAR / BLOCK_SIZE, BATCH_SIZE / BLOCK_SIZE);
-  dim3 FcBlockDim(BLOCK_SIZE, BLOCK_SIZE);
+  dim3 FcGridDim(NUM_CHAR / FC_BLOCK_SIZE, BATCH_SIZE / FC_BLOCK_SIZE);
+  dim3 FcBlockDim(FC_BLOCK_SIZE, FC_BLOCK_SIZE);
   dim3 reduceGridDim(BATCH_SIZE);
   dim3 reduceBlockDim(NUM_CHAR/2);
   dim3 randomGridDim(BATCH_SIZE / R_BATCH_PAR);
